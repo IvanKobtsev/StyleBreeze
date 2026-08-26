@@ -17,6 +17,14 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
       - run: cargo build -p stylebreeze --release
+      - name: Upload StyleBreeze server
+        uses: actions/upload-artifact@v4
+        with:
+          name: stylebreeze-server-${{ matrix.os }}
+          path: |
+            target/release/stylebreeze
+            target/release/stylebreeze.exe
+          if-no-files-found: error
   intellij:
     runs-on: ubuntu-latest
     steps:
@@ -27,4 +35,9 @@ jobs:
           java-version: '21'
       - uses: gradle/actions/setup-gradle@v4
       - run: gradle -p editors/intellij test buildPlugin
-
+      - name: Upload WebStorm plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: stylebreeze-webstorm-plugin
+          path: editors/intellij/build/distributions/*.zip
+          if-no-files-found: error

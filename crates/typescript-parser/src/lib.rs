@@ -94,18 +94,17 @@ fn scan_imports(source: &str, facts: &mut TypeScriptFacts) {
     while i + 6 <= bytes.len() {
         if &source[i..i + 6] == "import" && (i == 0 || !ident(bytes[i - 1])) {
             let mut j = skip_ws(bytes, i + 6);
-            let binding_start;
-            if j < bytes.len() && bytes[j] == b'*' {
+            let binding_start = if j < bytes.len() && bytes[j] == b'*' {
                 j = skip_ws(bytes, j + 1);
                 if source.get(j..j + 2) != Some("as") {
                     i += 6;
                     continue;
                 }
                 j = skip_ws(bytes, j + 2);
-                binding_start = j;
+                j
             } else {
-                binding_start = j;
-            }
+                j
+            };
             while j < bytes.len() && ident(bytes[j]) {
                 j += 1;
             }
