@@ -85,7 +85,7 @@ impl Default for Project {
         Self {
             files: HashMap::new(),
             roots: Vec::new(),
-            resolver: Box::new(FileSystemResolver),
+            resolver: Box::new(FileSystemResolver::default()),
         }
     }
 }
