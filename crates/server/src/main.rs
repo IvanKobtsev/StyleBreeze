@@ -170,6 +170,8 @@ fn handle_request(c: &Connection, p: &Project, r: Request) -> Result<()> {
                 .completions_at(&path, at)
                 .into_iter()
                 .map(|label| CompletionItem {
+                    sort_text: Some(format!("0000-{label}")),
+                    preselect: Some(true),
                     label,
                     kind: Some(CompletionItemKind::FIELD),
                     detail: Some("CSS Module export".into()),

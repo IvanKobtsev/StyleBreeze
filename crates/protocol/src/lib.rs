@@ -50,6 +50,7 @@ pub fn diagnostic_to_lsp(d: &Diagnostic, source: &str) -> LspDiagnostic {
         range: span_to_range(source, d.location.span),
         severity: Some(match d.severity {
             Severity::Error => DiagnosticSeverity::ERROR,
+            Severity::Warning => DiagnosticSeverity::WARNING,
             Severity::Information => DiagnosticSeverity::INFORMATION,
         }),
         code: Some(lsp_types::NumberOrString::String(d.code.into())),

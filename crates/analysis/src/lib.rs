@@ -23,6 +23,7 @@ pub struct Location {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Severity {
     Error,
+    Warning,
     Information,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -327,7 +328,7 @@ impl Project {
                             path: p.clone(),
                             span: r.span,
                         },
-                        severity: Severity::Error,
+                        severity: Severity::Warning,
                         code: "unknown-export",
                         message: format!("CSS Module has no export named '{}'", r.name),
                     });
@@ -497,6 +498,7 @@ mod tests {
             css.canonicalize().unwrap()
         );
         assert_eq!(p.diagnostics_for(&ts).len(), 1);
+        assert_eq!(p.diagnostics_for(&ts)[0].severity, Severity::Warning);
         assert_eq!(p.rename(&ts, at, "renamed").unwrap().len(), 2);
         let completion_offset =
             p.source(&ts).unwrap().find("styles.myClass").unwrap() + "styles.".len();

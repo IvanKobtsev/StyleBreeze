@@ -11,5 +11,9 @@
     <gotoDeclarationHandler
         implementation="dev.stylebreeze.intellij.StyleBreezeGotoDeclarationHandler"
         order="first"/>
+    <completion.contributor
+        language="any"
+        implementationClass="dev.stylebreeze.intellij.StyleBreezeCompletionContributor"
+        order="first"/>
   </extensions>
 </idea-plugin>
