@@ -92,11 +92,11 @@ fn scan_imports(source: &str, facts: &mut TypeScriptFacts) {
     let bytes = source.as_bytes();
     let mut i = 0;
     while i + 6 <= bytes.len() {
-        if &source[i..i + 6] == "import" && (i == 0 || !ident(bytes[i - 1])) {
+        if &bytes[i..i + 6] == b"import" && (i == 0 || !ident(bytes[i - 1])) {
             let mut j = skip_ws(bytes, i + 6);
             let binding_start = if j < bytes.len() && bytes[j] == b'*' {
                 j = skip_ws(bytes, j + 1);
-                if source.get(j..j + 2) != Some("as") {
+                if bytes.get(j..j + 2) != Some(b"as") {
                     i += 6;
                     continue;
                 }
@@ -213,5 +213,16 @@ mod tests {
         );
         assert_eq!(f.imports.len(), 1);
         assert_eq!(f.accesses.len(), 4);
+    }
+
+    #[test]
+    fn unicode_before_import_does_not_split_utf8() {
+        let f = parse_typescript(
+            Path::new("unicode.ts"),
+            "const caption = 'Wait…'; import styles from './x.module.css'; styles.root;",
+        );
+        assert_eq!(f.imports.len(), 1);
+        assert_eq!(f.accesses.len(), 1);
+        assert_eq!(f.accesses[0].class_name.as_deref(), Some("root"));
     }
 }
