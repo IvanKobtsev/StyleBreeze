@@ -8,5 +8,8 @@
   <depends>JavaScript</depends>
   <extensions defaultExtensionNs="com.intellij">
     <platform.lsp.integrationProvider implementation="dev.stylebreeze.intellij.StyleBreezeLspProvider"/>
+    <gotoDeclarationHandler
+        implementation="dev.stylebreeze.intellij.StyleBreezeGotoDeclarationHandler"
+        order="first"/>
   </extensions>
 </idea-plugin>

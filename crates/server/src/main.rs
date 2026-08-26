@@ -19,6 +19,10 @@ fn main() -> Result<()> {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         definition_provider: Some(OneOf::Left(true)),
         references_provider: Some(OneOf::Left(true)),
+        completion_provider: Some(CompletionOptions {
+            trigger_characters: Some(vec![".".into()]),
+            ..Default::default()
+        }),
         rename_provider: Some(OneOf::Right(RenameOptions {
             prepare_provider: Some(true),
             work_done_progress_options: Default::default(),
@@ -148,6 +152,31 @@ fn handle_request(c: &Connection, p: &Project, r: Request) -> Result<()> {
                 .filter_map(|l| p.source(&l.path).and_then(|s| location_to_lsp(&l, s)))
                 .collect();
             Ok(serde_json::to_value(locs)?)
+        }
+        req::Completion::METHOD => {
+            let q: CompletionParams = serde_json::from_value(r.params)?;
+            let path = q
+                .text_document_position
+                .text_document
+                .uri
+                .to_file_path()
+                .map_err(|_| anyhow::anyhow!("invalid file URI"))?;
+            let at = position_to_offset(
+                p.source(&path).unwrap_or(""),
+                q.text_document_position.position,
+            )
+            .unwrap_or(0);
+            let items: Vec<_> = p
+                .completions_at(&path, at)
+                .into_iter()
+                .map(|label| CompletionItem {
+                    label,
+                    kind: Some(CompletionItemKind::FIELD),
+                    detail: Some("CSS Module export".into()),
+                    ..Default::default()
+                })
+                .collect();
+            Ok(serde_json::to_value(CompletionResponse::Array(items))?)
         }
         req::PrepareRenameRequest::METHOD => {
             let q: TextDocumentPositionParams = serde_json::from_value(r.params)?;

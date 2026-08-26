@@ -49,11 +49,17 @@ struct Reference {
     span: Span,
 }
 #[derive(Clone, Debug)]
+struct ModuleImport {
+    binding: String,
+    module: PathBuf,
+}
+#[derive(Clone, Debug)]
 struct FileRecord {
     source: String,
     version: Option<i32>,
     exports: Vec<Export>,
     references: Vec<Reference>,
+    imports: Vec<ModuleImport>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -119,6 +125,7 @@ impl Project {
         let path = canonical_or(path);
         let mut exports = Vec::new();
         let mut references = Vec::new();
+        let mut imports = Vec::new();
         let mut diagnostics = Vec::new();
         if stylesheet(&path) {
             let facts = parse_stylesheet(&source);
@@ -153,7 +160,7 @@ impl Project {
             }
         } else {
             let facts = parse_typescript(&path, &source);
-            let imports: HashMap<_, _> = facts
+            let resolved_imports: HashMap<_, _> = facts
                 .imports
                 .iter()
                 .filter_map(|i| {
@@ -163,9 +170,16 @@ impl Project {
                         .map(|p| (i.binding.clone(), p))
                 })
                 .collect();
+            imports = resolved_imports
+                .iter()
+                .map(|(binding, module)| ModuleImport {
+                    binding: binding.clone(),
+                    module: module.clone(),
+                })
+                .collect();
             let mut dynamic = HashSet::new();
             for a in facts.accesses {
-                if let Some(module) = imports.get(&a.binding) {
+                if let Some(module) = resolved_imports.get(&a.binding) {
                     if let Some(name) = a.class_name {
                         references.push(Reference {
                             module: module.clone(),
@@ -202,6 +216,7 @@ impl Project {
                 version,
                 exports,
                 references,
+                imports,
                 diagnostics,
             },
         );
@@ -327,6 +342,30 @@ impl Project {
             .flat_map(|p| self.diagnostics_for(p))
             .collect()
     }
+    pub fn completions_at(&self, path: &Path, offset: usize) -> Vec<String> {
+        let path = canonical_or(path.to_path_buf());
+        let Some(file) = self.files.get(&path) else {
+            return Vec::new();
+        };
+        let Some((binding, prefix)) = member_context(&file.source, offset) else {
+            return Vec::new();
+        };
+        let Some(import) = file.imports.iter().find(|i| i.binding == binding) else {
+            return Vec::new();
+        };
+        let Some(module) = self.files.get(&import.module) else {
+            return Vec::new();
+        };
+        let mut names: Vec<_> = module
+            .exports
+            .iter()
+            .filter(|e| e.name.starts_with(prefix) && valid_dot_name(&e.name))
+            .map(|e| e.name.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
     pub fn file_paths(&self) -> impl Iterator<Item = &Path> {
         self.files.keys().map(PathBuf::as_path)
     }
@@ -386,6 +425,39 @@ fn valid_name(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
         && !s.as_bytes()[0].is_ascii_digit()
 }
+fn valid_dot_name(s: &str) -> bool {
+    !s.is_empty()
+        && !s.as_bytes()[0].is_ascii_digit()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$'))
+}
+fn member_context(source: &str, offset: usize) -> Option<(&str, &str)> {
+    if offset > source.len() || !source.is_char_boundary(offset) {
+        return None;
+    }
+    let bytes = source.as_bytes();
+    let mut prefix_start = offset;
+    while prefix_start > 0 && ident_member(bytes[prefix_start - 1]) {
+        prefix_start -= 1;
+    }
+    if prefix_start == 0 || bytes[prefix_start - 1] != b'.' {
+        return None;
+    }
+    let binding_end = prefix_start - 1;
+    let mut binding_start = binding_end;
+    while binding_start > 0 && ident_member(bytes[binding_start - 1]) {
+        binding_start -= 1;
+    }
+    (binding_start < binding_end).then(|| {
+        (
+            &source[binding_start..binding_end],
+            &source[prefix_start..offset],
+        )
+    })
+}
+fn ident_member(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'$')
+}
 fn canonical_or(p: PathBuf) -> PathBuf {
     p.canonicalize().unwrap_or(p)
 }
@@ -426,5 +498,8 @@ mod tests {
         );
         assert_eq!(p.diagnostics_for(&ts).len(), 1);
         assert_eq!(p.rename(&ts, at, "renamed").unwrap().len(), 2);
+        let completion_offset =
+            p.source(&ts).unwrap().find("styles.myClass").unwrap() + "styles.".len();
+        assert_eq!(p.completions_at(&ts, completion_offset), ["myClass"]);
     }
 }
