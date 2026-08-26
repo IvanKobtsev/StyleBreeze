@@ -1,0 +1,18 @@
+[package]
+name = "stylebreeze"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+lsp-server.workspace = true
+lsp-types.workspace = true
+serde_json.workspace = true
+stylebreeze-analysis = { path = "../analysis" }
+stylebreeze-protocol = { path = "../protocol" }
+walkdir.workspace = true
+
+[lints]
+workspace = true
+

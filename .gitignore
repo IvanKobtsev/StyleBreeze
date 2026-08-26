@@ -1,0 +1,9 @@
+/target/
+/.idea/workspace.xml
+/.idea/shelf/
+/.idea/httpRequests/
+/.gradle/
+**/build/
+editors/intellij/src/main/resources/bin/*
+!editors/intellij/src/main/resources/bin/README.md
+

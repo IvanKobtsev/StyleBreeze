@@ -1,0 +1,20 @@
+[package]
+name = "stylebreeze-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+stylebreeze-resolver = { path = "../resolver" }
+stylebreeze-stylesheet-parser = { path = "../stylesheet-parser" }
+stylebreeze-typescript-parser = { path = "../typescript-parser" }
+thiserror.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
+

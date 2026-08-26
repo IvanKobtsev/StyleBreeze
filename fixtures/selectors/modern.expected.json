@@ -1,0 +1,9 @@
+{
+  "localExports": [
+    "myClass", "first", "second", "disabled", "icon",
+    "parent", "active", "parent__child", "local"
+  ],
+  "globalClasses": ["external", "externalBlock", "thirdParty"],
+  "diagnostics": ["unresolved-sass-interpolation"]
+}
+

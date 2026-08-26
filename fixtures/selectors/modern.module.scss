@@ -1,0 +1,17 @@
+:where(.myClass) {}
+:is(.first, :global(.external), .second) {}
+:not(.disabled) {}
+:has(> .icon) {}
+
+.parent {
+  &:where(.active) {}
+  &__child {}
+}
+
+:global {
+  .externalBlock {}
+}
+
+.local :global(.thirdParty) {}
+.#{$prefix}-item {}
+
