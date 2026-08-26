@@ -10,7 +10,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/IvanKobtsev/StyleBreeze"
@@ -32,4 +32,3 @@ walkdir = "2.5"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
-

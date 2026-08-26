@@ -4,8 +4,9 @@
   <vendor>Ivan Kobtsev</vendor>
   <description>Reliable CSS Modules navigation powered by the StyleBreeze language server.</description>
   <depends>com.intellij.modules.ultimate</depends>
+  <depends>com.intellij.modules.lsp</depends>
+  <depends>JavaScript</depends>
   <extensions defaultExtensionNs="com.intellij">
-    <platform.lsp.serverSupportProvider implementation="dev.stylebreeze.intellij.StyleBreezeLspProvider"/>
+    <platform.lsp.integrationProvider implementation="dev.stylebreeze.intellij.StyleBreezeLspProvider"/>
   </extensions>
 </idea-plugin>
-
