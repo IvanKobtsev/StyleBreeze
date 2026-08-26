@@ -21,7 +21,11 @@ internal object BundledServer {
         val input = checkNotNull(javaClass.getResourceAsStream(resource)) { "Missing bundled server $resource" }
         val bytes = input.use { it.readBytes() }
         val digest = MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
-        val target = Path.of(PathManager.getPluginTempPath(), "stylebreeze", digest, platform.substringAfterLast('/'))
+        val target = PathManager.getSystemDir()
+            .resolve("plugins")
+            .resolve("stylebreeze")
+            .resolve(digest)
+            .resolve(platform.substringAfterLast('/'))
         if (!Files.exists(target)) {
             Files.createDirectories(target.parent)
             Files.copy(bytes.inputStream(), target, StandardCopyOption.REPLACE_EXISTING)
@@ -30,4 +34,3 @@ internal object BundledServer {
         return target
     }
 }
-

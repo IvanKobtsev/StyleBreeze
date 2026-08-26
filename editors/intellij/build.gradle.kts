@@ -18,6 +18,9 @@ dependencies {
 kotlin { jvmToolchain(21) }
 
 intellijPlatform {
+    // StyleBreeze has no GUI Designer forms and Kotlin already emits its null
+    // checks, so JetBrains bytecode instrumentation is unnecessary.
+    instrumentCode = false
     pluginConfiguration {
         ideaVersion { sinceBuild = "262" }
     }
