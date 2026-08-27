@@ -84,7 +84,12 @@ class StyleBreezeGotoDeclarationHandler : GotoDeclarationHandler {
                     references.map { Target(it.uri, it.range) },
                 ).filterNot { it.containingFile?.virtualFile == file }
                 return when (targets.size) {
-                    0 -> emptyArray()
+                    // IntelliJ continues to later declaration handlers when an
+                    // extension returns an empty array. Return a no-op target so
+                    // a recognized module class with no script usages remains
+                    // authoritative and built-in CSS providers cannot substitute
+                    // unrelated same-named declarations.
+                    0 -> arrayOf(StyleBreezeUsagesTarget(element, actualEditor, emptyList()))
                     1 -> targets.toTypedArray()
                     else -> arrayOf(StyleBreezeUsagesTarget(element, actualEditor, targets))
                 }
