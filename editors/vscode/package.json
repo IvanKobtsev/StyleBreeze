@@ -1,0 +1,62 @@
+{
+  "name": "stylebreeze",
+  "displayName": "StyleBreeze",
+  "description": "Reliable CSS Modules navigation, rename, completion, and diagnostics powered by StyleBreeze.",
+  "version": "0.3.0",
+  "publisher": "ivankobtsev",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/IvanKobtsev/StyleBreeze.git"
+  },
+  "homepage": "https://github.com/IvanKobtsev/StyleBreeze#readme",
+  "bugs": "https://github.com/IvanKobtsev/StyleBreeze/issues",
+  "keywords": ["css-modules", "scss", "typescript", "navigation", "lsp"],
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": ["Programming Languages", "Other"],
+  "activationEvents": [
+    "onLanguage:css",
+    "onLanguage:scss",
+    "onLanguage:typescript",
+    "onLanguage:typescriptreact",
+    "onLanguage:javascript",
+    "onLanguage:javascriptreact"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "StyleBreeze",
+      "properties": {
+        "styleBreeze.server.path": {
+          "type": "string",
+          "default": "",
+          "description": "Optional path to a StyleBreeze server binary. The bundled binary is used when empty."
+        },
+        "styleBreeze.server.trace": {
+          "type": "string",
+          "enum": ["off", "messages", "verbose"],
+          "default": "off",
+          "description": "Language-server protocol trace level."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "esbuild src/extension.ts --bundle --platform=node --external:vscode --outfile=dist/extension.js",
+    "check": "tsc --noEmit",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.95.0",
+    "@vscode/vsce": "^3.2.1",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.0"
+  },
+  "packageManager": "pnpm@11.19.0"
+}

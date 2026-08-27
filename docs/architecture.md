@@ -7,6 +7,7 @@ CSS/SCSS -> stylesheet-parser --\
                                   analysis index -> protocol -> LSP server
 JS/TS/TSX -> typescript-parser --/                    |
 relative imports -> resolver -------------------------+-> WebStorm plugin
+                                                    \-> VS Code extension
 ```
 
 The analysis crate owns project facts and operations. Parser spans are UTF-8 byte
@@ -20,5 +21,5 @@ The MVP supports `.module.css`/`.module.scss`, relative imports, default and
 namespace bindings, dot and literal bracket access, modern selector functions,
 CSS Modules scope, basic Sass nesting, navigation, references, diagnostics, and
 safe rename. Sass graphs, interpolation evaluation, naming conventions, ICSS,
-completion, unused exports, hover, and CodeLens are intentionally deferred.
+hover and CodeLens are intentionally deferred.
  

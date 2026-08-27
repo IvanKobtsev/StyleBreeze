@@ -25,15 +25,94 @@ jobs:
             target/release/stylebreeze
             target/release/stylebreeze.exe
           if-no-files-found: error
+  vscode:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: editors/vscode
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run check
+      - run: pnpm run compile
+  editor-binaries:
+    strategy:
+      matrix:
+        include:
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, binary: stylebreeze.exe }
+          - { os: windows-latest, target: aarch64-pc-windows-msvc, binary: stylebreeze.exe }
+          - { os: macos-15-intel, target: x86_64-apple-darwin, binary: stylebreeze }
+          - { os: macos-14, target: aarch64-apple-darwin, binary: stylebreeze }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu, binary: stylebreeze }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu, binary: stylebreeze, cross: arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - if: matrix.cross == 'arm64'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - if: matrix.cross == 'arm64'
+        run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+      - run: cargo build --release -p stylebreeze --target ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stylebreeze-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          if-no-files-found: error
+  vscode-package:
+    needs: [vscode, editor-binaries]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - { platform: win32-x64, target: x86_64-pc-windows-msvc, binary: stylebreeze.exe }
+          - { platform: win32-arm64, target: aarch64-pc-windows-msvc, binary: stylebreeze.exe }
+          - { platform: darwin-x64, target: x86_64-apple-darwin, binary: stylebreeze }
+          - { platform: darwin-arm64, target: aarch64-apple-darwin, binary: stylebreeze }
+          - { platform: linux-x64, target: x86_64-unknown-linux-gnu, binary: stylebreeze }
+          - { platform: linux-arm64, target: aarch64-unknown-linux-gnu, binary: stylebreeze }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.19.0
+      - run: pnpm install --frozen-lockfile
+        working-directory: editors/vscode
+      - uses: actions/download-artifact@v4
+        with:
+          name: stylebreeze-${{ matrix.target }}
+          path: editors/vscode/bin/${{ matrix.platform }}
+      - if: ${{ !startsWith(matrix.platform, 'win32-') }}
+        run: chmod +x editors/vscode/bin/${{ matrix.platform }}/${{ matrix.binary }}
+      - run: pnpm run compile
+        working-directory: editors/vscode
+      - run: pnpm exec vsce package --no-dependencies --target ${{ matrix.platform }} --out stylebreeze-${{ matrix.platform }}.vsix
+        working-directory: editors/vscode
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stylebreeze-vscode-${{ matrix.platform }}
+          path: editors/vscode/stylebreeze-${{ matrix.platform }}.vsix
+          if-no-files-found: error
   intellij:
-    needs: rust
+    needs: [rust, editor-binaries]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Download Windows language server
         uses: actions/download-artifact@v4
         with:
-          name: stylebreeze-server-windows-latest
+          name: stylebreeze-x86_64-pc-windows-msvc
           path: editors/intellij/src/main/resources/bin/windows-x64
       - uses: actions/setup-java@v4
         with:

@@ -4,6 +4,9 @@
 /.idea/httpRequests/
 /.gradle/
 **/build/
+**/node_modules/
+editors/vscode/dist/
+editors/vscode/bin/
+editors/vscode/*.vsix
 editors/intellij/src/main/resources/bin/*
 !editors/intellij/src/main/resources/bin/README.md
-
