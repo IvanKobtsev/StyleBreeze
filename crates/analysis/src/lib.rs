@@ -63,12 +63,16 @@ struct ModifierRule {
     selector: Span,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ModifierRequirement {
+    pub required_all: Vec<String>,
+    pub base_locations: Vec<Location>,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ModifierDecoration {
     pub modifier: String,
-    pub required_all: Vec<String>,
+    pub alternatives: Vec<ModifierRequirement>,
     pub range: Span,
     pub selector: Span,
-    pub base_locations: Vec<Location>,
     pub standalone: bool,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -547,13 +551,37 @@ impl Project {
                 .any(|candidate| candidate.uncertain_modules.contains(&p));
             if !usage_is_uncertain {
                 for export in &f.exports {
-                    let used = self.files.values().any(|candidate| {
-                        candidate
-                            .references
-                            .iter()
-                            .any(|reference| reference.module == p && reference.name == export.name)
-                    });
-                    if !used {
+                    let mut references = Vec::new();
+                    for candidate in self.files.values() {
+                        for reference in &candidate.references {
+                            if reference.module == p && reference.name == export.name {
+                                references.push((candidate, reference));
+                            }
+                        }
+                    }
+                    let rules: Vec<_> = f
+                        .modifier_rules
+                        .iter()
+                        .filter(|rule| rule.modifier == export.name)
+                        .collect();
+                    if rules.is_empty() {
+                        if references.is_empty() {
+                            out.extend(export.occurrences.iter().map(|span| Diagnostic {
+                                location: Location {
+                                    path: p.clone(),
+                                    span: *span,
+                                },
+                                severity: Severity::Hint,
+                                code: "unused-export",
+                                message: format!("CSS Module export '{}' is unused", export.name),
+                                unnecessary: true,
+                            }));
+                        }
+                        continue;
+                    }
+                    let modifier_spans: HashSet<_> =
+                        rules.iter().map(|rule| rule.modifier_span).collect();
+                    if references.is_empty() {
                         out.extend(export.occurrences.iter().map(|span| Diagnostic {
                             location: Location {
                                 path: p.clone(),
@@ -564,6 +592,43 @@ impl Project {
                             message: format!("CSS Module export '{}' is unused", export.name),
                             unnecessary: true,
                         }));
+                        continue;
+                    }
+                    let relationship_usage_unknown = references
+                        .iter()
+                        .any(|(_, reference)| !reference.composition_certain);
+                    let mut used_relationships = HashSet::new();
+                    if !relationship_usage_unknown {
+                        for rule in &rules {
+                            if references.iter().any(|(candidate, reference)| {
+                                self.reference_satisfies(candidate, reference, &rule.required_all)
+                            }) {
+                                used_relationships.insert(modifier_relationship_key(rule));
+                            }
+                        }
+                    }
+                    if !relationship_usage_unknown {
+                        for span in &modifier_spans {
+                            let occurrence_used = rules.iter().any(|rule| {
+                                rule.modifier_span == *span
+                                    && used_relationships.contains(&modifier_relationship_key(rule))
+                            });
+                            if !occurrence_used {
+                                out.push(Diagnostic {
+                                    location: Location {
+                                        path: p.clone(),
+                                        span: *span,
+                                    },
+                                    severity: Severity::Hint,
+                                    code: "unused-export",
+                                    message: format!(
+                                        "CSS Module modifier relationship '{}' is unused",
+                                        export.name
+                                    ),
+                                    unnecessary: true,
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -616,29 +681,39 @@ impl Project {
                 .entry((rule.modifier.clone(), rule.modifier_span, rule.selector))
                 .or_insert_with(|| ModifierDecoration {
                     modifier: rule.modifier.clone(),
-                    required_all: Vec::new(),
+                    alternatives: Vec::new(),
                     range: rule.modifier_span,
                     selector: rule.selector,
-                    base_locations: Vec::new(),
                     standalone,
                 });
-            for required in &rule.required_all {
-                if !entry.required_all.contains(required) {
-                    entry.required_all.push(required.clone());
-                }
-            }
-            entry
-                .base_locations
-                .extend(rule.base_spans.iter().map(|span| Location {
+            let mut required_all = rule.required_all.clone();
+            required_all.sort();
+            required_all.dedup();
+            let mut base_locations: Vec<_> = rule
+                .base_spans
+                .iter()
+                .map(|span| Location {
                     path: path.clone(),
                     span: *span,
-                }));
+                })
+                .collect();
+            base_locations.sort_by_key(|location| location.span.start);
+            base_locations.dedup();
+            if !entry
+                .alternatives
+                .iter()
+                .any(|alternative| alternative.required_all == required_all)
+            {
+                entry.alternatives.push(ModifierRequirement {
+                    required_all,
+                    base_locations,
+                });
+            }
         }
         let mut out: Vec<_> = grouped.into_values().collect();
         for item in &mut out {
-            item.required_all.sort();
-            item.base_locations.sort_by_key(|l| l.span.start);
-            item.base_locations.dedup();
+            item.alternatives
+                .sort_by(|a, b| a.required_all.cmp(&b.required_all));
         }
         out.sort_by_key(|d| d.range.start);
         out
@@ -680,20 +755,31 @@ impl Project {
         if rules.is_empty() {
             return None;
         }
-        let mut bases: Vec<_> = rules
+        let mut alternatives: Vec<_> = rules
             .iter()
-            .flat_map(|r| r.required_all.iter().cloned())
+            .map(|rule| {
+                let mut required = rule.required_all.clone();
+                required.sort();
+                required.dedup();
+                required
+            })
             .collect();
-        bases.sort();
-        bases.dedup();
+        alternatives.sort();
+        alternatives.dedup();
         let standalone = module_file
             .exports
             .iter()
             .find(|e| e.name == name)
             .is_some_and(|e| e.independent);
-        let requirement = bases
+        let requirement = alternatives
             .iter()
-            .map(|b| format!("`.{b}`"))
+            .map(|required| {
+                required
+                    .iter()
+                    .map(|base| format!("`.{base}`"))
+                    .collect::<Vec<_>>()
+                    .join(" + ")
+            })
             .collect::<Vec<_>>()
             .join(" or ");
         let suffix = if standalone {
@@ -799,6 +885,12 @@ fn inside(s: Span, o: usize) -> bool {
 }
 fn span_contains(outer: Span, inner: Span) -> bool {
     outer.start <= inner.start && outer.end >= inner.end
+}
+fn modifier_relationship_key(rule: &ModifierRule) -> (String, Vec<String>) {
+    let mut required = rule.required_all.clone();
+    required.sort();
+    required.dedup();
+    (rule.modifier.clone(), required)
 }
 fn valid_name(s: &str) -> bool {
     !s.is_empty()
@@ -974,5 +1066,97 @@ mod tests {
             "active"
         );
         assert!(definitions[0].span.start > css_source.find("&.active").unwrap());
+    }
+
+    #[test]
+    fn nested_modifier_uses_full_chain_for_navigation_and_hover() {
+        let d = tempdir().unwrap();
+        let css = d.path().join("x.module.scss");
+        let ts = d.path().join("x.tsx");
+        fs::write(&css, ".gradientWrapper { &.offset { &.narrow {} } }").unwrap();
+        fs::write(
+            &ts,
+            "import s from './x.module.scss'; <i className={clsx(s.gradientWrapper, s.offset, s.narrow)} />",
+        )
+        .unwrap();
+        let mut p = Project::new(vec![d.path().into()]);
+        p.index_workspace();
+        let source = p.source(&ts).unwrap();
+        let at = source.rfind("narrow").unwrap();
+        let definitions = p.definitions_at(&ts, at);
+        assert_eq!(definitions.len(), 1);
+        assert!(p.diagnostics_for(&ts).is_empty());
+        let hover = p.hover_at(&ts, at).unwrap();
+        assert!(hover.markdown.contains("`.gradientWrapper` + `.offset`"));
+        let decorations = p.modifier_decorations(&css);
+        let narrow = decorations
+            .iter()
+            .find(|decoration| decoration.modifier == "narrow")
+            .unwrap();
+        assert_eq!(narrow.alternatives.len(), 1);
+        assert_eq!(
+            narrow.alternatives[0].required_all,
+            ["gradientWrapper", "offset"]
+        );
+
+        p.open_or_update_file(
+            ts.clone(),
+            "import s from './x.module.scss'; <i className={clsx(s.gradientWrapper, s.narrow)} />"
+                .into(),
+            Some(2),
+        );
+        assert!(p.diagnostics_for(&ts).iter().any(|diagnostic| {
+            diagnostic.code == "dependent-modifier-without-base"
+                && diagnostic.message.contains("gradientWrapper + offset")
+        }));
+    }
+
+    #[test]
+    fn unused_modifier_diagnostics_are_grouped_by_exact_relationship() {
+        let d = tempdir().unwrap();
+        let css = d.path().join("x.module.scss");
+        let ts = d.path().join("x.tsx");
+        let css_source =
+            ".first { &.active {} } .first { &.active {} } .second { &.active {} } .active {}";
+        fs::write(&css, css_source).unwrap();
+        fs::write(
+            &ts,
+            "import s from './x.module.scss'; <i className={clsx(s.first, s.active)} />",
+        )
+        .unwrap();
+        let mut p = Project::new(vec![d.path().into()]);
+        p.index_workspace();
+        let unused_active: Vec<_> = p
+            .diagnostics_for(&css)
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code == "unused-export"
+                    && &css_source[diagnostic.location.span.start..diagnostic.location.span.end]
+                        == "active"
+            })
+            .collect();
+        assert_eq!(unused_active.len(), 1);
+        assert!(unused_active[0].location.span.start > css_source.find(".second").unwrap());
+    }
+
+    #[test]
+    fn uncertain_modifier_composition_suppresses_relationship_unused_hints() {
+        let d = tempdir().unwrap();
+        let css = d.path().join("x.module.scss");
+        let ts = d.path().join("x.tsx");
+        fs::write(&css, ".first { &.active {} } .second { &.active {} }").unwrap();
+        fs::write(
+            &ts,
+            "import s from './x.module.scss'; <i className={unknownHelper(s.active)} />",
+        )
+        .unwrap();
+        let mut p = Project::new(vec![d.path().into()]);
+        p.index_workspace();
+        let css_source = p.source(&css).unwrap();
+        assert!(p.diagnostics_for(&css).iter().all(|diagnostic| {
+            diagnostic.code != "unused-export"
+                || &css_source[diagnostic.location.span.start..diagnostic.location.span.end]
+                    != "active"
+        }));
     }
 }

@@ -132,7 +132,10 @@ interface ProtocolLocation {
 
 interface ModifierDecoration {
   modifier: string;
-  requiredAll: string[];
+  alternatives: Array<{
+    requiredAll: string[];
+    baseLocations: ProtocolLocation[];
+  }>;
   range: ProtocolLocation['range'];
   standalone: boolean;
 }
@@ -166,7 +169,9 @@ async function refreshModifierDecorations(editor: vscode.TextEditor): Promise<vo
         item.range.end.character,
       ),
       hoverMessage: new vscode.MarkdownString(
-        `Modifier of ${item.requiredAll.map((name) => `\`.${name}\``).join(' or ')}${item.standalone ? ' (also usable independently)' : ''}`,
+        `Modifier of ${item.alternatives
+          .map((alternative) => alternative.requiredAll.map((name) => `\`.${name}\``).join(' + '))
+          .join(' or ')}${item.standalone ? ' (also usable independently)' : ''}`,
       ),
     })),
   );

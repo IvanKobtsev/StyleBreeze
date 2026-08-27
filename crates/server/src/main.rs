@@ -215,12 +215,16 @@ fn handle_request(c: &Connection, p: &Project, r: Request) -> Result<()> {
             let items: Vec<_> = p.modifier_decorations(&path).into_iter().map(|item| {
                 serde_json::json!({
                     "modifier": item.modifier,
-                    "requiredAll": item.required_all,
+                    "alternatives": item.alternatives.into_iter().map(|alternative| {
+                        serde_json::json!({
+                            "requiredAll": alternative.required_all,
+                            "baseLocations": alternative.base_locations.into_iter().filter_map(|location| {
+                                p.source(&location.path).and_then(|base_source| location_to_lsp(&location, base_source))
+                            }).collect::<Vec<_>>(),
+                        })
+                    }).collect::<Vec<_>>(),
                     "range": span_to_range(source, item.range),
                     "selectorRange": span_to_range(source, item.selector),
-                    "baseLocations": item.base_locations.into_iter().filter_map(|location| {
-                        p.source(&location.path).and_then(|base_source| location_to_lsp(&location, base_source))
-                    }).collect::<Vec<_>>(),
                     "standalone": item.standalone,
                 })
             }).collect();
