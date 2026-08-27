@@ -1,6 +1,10 @@
 use oxc_allocator::Allocator;
+use oxc_ast::ast::{
+    CallExpression, ConditionalExpression, JSXAttribute, JSXAttributeName, JSXAttributeValue,
+};
+use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
-use oxc_span::SourceType;
+use oxc_span::{GetSpan, SourceType};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -30,6 +34,9 @@ pub struct StyleAccess {
     pub class_name: Option<String>,
     pub span: Span,
     pub kind: AccessKind,
+    pub composition: Option<Span>,
+    pub composition_root: Option<Span>,
+    pub composition_certain: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -47,6 +54,12 @@ pub fn parse_typescript(path: &Path, source: &str) -> TypeScriptFacts {
     let allocator = Allocator::default();
     let source_type = SourceType::from_path(path).unwrap_or_default();
     let parsed = Parser::new(&allocator, source, source_type).parse();
+    let mut composition_visitor = ClassNameVisitor {
+        source,
+        roots: Vec::new(),
+        branches: Vec::new(),
+    };
+    composition_visitor.visit_program(&parsed.program);
     let mut facts = TypeScriptFacts {
         parse_errors: parsed.errors.into_iter().map(|e| e.to_string()).collect(),
         ..Default::default()
@@ -55,6 +68,37 @@ pub fn parse_typescript(path: &Path, source: &str) -> TypeScriptFacts {
     // This range-preserving scanner extracts only the deliberately tiny CSS Modules grammar.
     scan_imports(source, &mut facts);
     scan_accesses(source, &mut facts);
+    let roots = composition_visitor.roots;
+    let mut compositions = roots.clone();
+    compositions.extend(composition_visitor.branches);
+    for access in &mut facts.accesses {
+        if let Some((span, certain)) = compositions
+            .iter()
+            .filter(|(span, _)| access.span.start >= span.start && access.span.end <= span.end)
+            .min_by_key(|(span, _)| span.end - span.start)
+        {
+            access.composition = Some(*span);
+            access.composition_certain = *certain;
+        }
+        access.composition_root = roots
+            .iter()
+            .find(|(span, _)| access.span.start >= span.start && access.span.end <= span.end)
+            .map(|(span, _)| *span);
+    }
+    let dynamic_roots: Vec<_> = facts
+        .accesses
+        .iter()
+        .filter(|access| access.kind == AccessKind::Dynamic)
+        .filter_map(|access| access.composition_root)
+        .collect();
+    for access in &mut facts.accesses {
+        if access
+            .composition_root
+            .is_some_and(|root| dynamic_roots.contains(&root))
+        {
+            access.composition_certain = false;
+        }
+    }
     facts
 }
 
@@ -164,6 +208,9 @@ fn scan_accesses(source: &str, facts: &mut TypeScriptFacts) {
                         class_name: Some(source[start..end].into()),
                         span: Span { start, end },
                         kind: AccessKind::Dot,
+                        composition: None,
+                        composition_root: None,
+                        composition_certain: false,
                     });
                 }
             } else if j < bytes.len() && bytes[j] == b'[' {
@@ -174,6 +221,9 @@ fn scan_accesses(source: &str, facts: &mut TypeScriptFacts) {
                         class_name: Some(name),
                         span,
                         kind: AccessKind::Bracket,
+                        composition: None,
+                        composition_root: None,
+                        composition_certain: false,
                     });
                 } else {
                     facts.accesses.push(StyleAccess {
@@ -184,6 +234,9 @@ fn scan_accesses(source: &str, facts: &mut TypeScriptFacts) {
                             end: j + 1,
                         },
                         kind: AccessKind::Dynamic,
+                        composition: None,
+                        composition_root: None,
+                        composition_certain: false,
                     });
                 }
             } else {
@@ -195,10 +248,78 @@ fn scan_accesses(source: &str, facts: &mut TypeScriptFacts) {
                         end: i + needle.len(),
                     },
                     kind: AccessKind::Dynamic,
+                    composition: None,
+                    composition_root: None,
+                    composition_certain: false,
                 });
             }
             i = j.saturating_add(1);
         }
+    }
+}
+
+struct ClassNameVisitor<'s> {
+    source: &'s str,
+    roots: Vec<(Span, bool)>,
+    branches: Vec<(Span, bool)>,
+}
+
+impl<'a> Visit<'a> for ClassNameVisitor<'_> {
+    fn visit_jsx_attribute(&mut self, attribute: &JSXAttribute<'a>) {
+        if matches!(&attribute.name, JSXAttributeName::Identifier(name) if name.name == "className")
+            && let Some(JSXAttributeValue::ExpressionContainer(container)) = &attribute.value
+        {
+            let span = container.expression.span();
+            if span.end > span.start {
+                let span = Span {
+                    start: span.start as usize,
+                    end: span.end as usize,
+                };
+                let expression = &self.source[span.start..span.end];
+                let certain = !expression.contains("...")
+                    && !expression.contains("=>")
+                    && !expression.contains("await ");
+                self.roots.push((span, certain));
+            }
+        }
+        walk::walk_jsx_attribute(self, attribute);
+    }
+
+    fn visit_conditional_expression(&mut self, expression: &ConditionalExpression<'a>) {
+        let whole = expression.span();
+        if self
+            .roots
+            .iter()
+            .any(|(root, _)| whole.start as usize >= root.start && whole.end as usize <= root.end)
+        {
+            for branch in [&expression.consequent, &expression.alternate] {
+                let span = branch.span();
+                self.branches.push((
+                    Span {
+                        start: span.start as usize,
+                        end: span.end as usize,
+                    },
+                    true,
+                ));
+            }
+        }
+        walk::walk_conditional_expression(self, expression);
+    }
+
+    fn visit_call_expression(&mut self, expression: &CallExpression<'a>) {
+        let span = expression.span();
+        if let Some((_, certain)) = self
+            .roots
+            .iter_mut()
+            .find(|(root, _)| span.start as usize >= root.start && span.end as usize <= root.end)
+        {
+            let callee = expression.callee.span();
+            let name = self.source[callee.start as usize..callee.end as usize].trim();
+            if !matches!(name, "clsx" | "classNames" | "cn") {
+                *certain = false;
+            }
+        }
+        walk::walk_call_expression(self, expression);
     }
 }
 
@@ -224,5 +345,42 @@ mod tests {
         assert_eq!(f.imports.len(), 1);
         assert_eq!(f.accesses.len(), 1);
         assert_eq!(f.accesses[0].class_name.as_deref(), Some("root"));
+    }
+
+    #[test]
+    fn associates_accesses_with_jsx_class_name_composition() {
+        let f = parse_typescript(
+            Path::new("x.tsx"),
+            "import s from './x.module.scss'; <button className={clsx(s.base, ok && s.active)} />",
+        );
+        assert_eq!(f.accesses.len(), 2);
+        assert!(f.accesses.iter().all(|a| a.composition.is_some()));
+        assert!(f.accesses.iter().all(|a| a.composition_certain));
+    }
+
+    #[test]
+    fn tracks_conditional_branches_and_unsupported_helpers() {
+        let conditional = parse_typescript(
+            Path::new("x.tsx"),
+            "import s from './x.module.scss'; <i className={ok ? clsx(s.base, s.active) : s.base} />",
+        );
+        let active = conditional
+            .accesses
+            .iter()
+            .find(|a| a.class_name.as_deref() == Some("active"))
+            .unwrap();
+        let alternate_base = conditional
+            .accesses
+            .iter()
+            .filter(|a| a.class_name.as_deref() == Some("base"))
+            .last()
+            .unwrap();
+        assert_ne!(active.composition, alternate_base.composition);
+
+        let unsupported = parse_typescript(
+            Path::new("x.tsx"),
+            "import s from './x.module.scss'; <i className={custom(s.active)} />",
+        );
+        assert!(!unsupported.accesses[0].composition_certain);
     }
 }

@@ -9,6 +9,7 @@ import {
 } from 'vscode-languageclient/node';
 
 let client: LanguageClient | undefined;
+let modifierDecoration: vscode.TextEditorDecorationType | undefined;
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   const settings = vscode.workspace.getConfiguration('styleBreeze');
@@ -84,6 +85,25 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     trace === 'verbose' ? Trace.Verbose : trace === 'messages' ? Trace.Messages : Trace.Off,
   );
   await client.start();
+  modifierDecoration = vscode.window.createTextEditorDecorationType({
+    light: { gutterIconPath: context.asAbsolutePath(path.join('resources', 'modifier-chain-light.svg')) },
+    dark: { gutterIconPath: context.asAbsolutePath(path.join('resources', 'modifier-chain-dark.svg')) },
+    gutterIconSize: 'contain',
+  });
+  context.subscriptions.push(modifierDecoration);
+  const refreshVisibleModifiers = (): void => {
+    for (const editor of vscode.window.visibleTextEditors) void refreshModifierDecorations(editor);
+  };
+  context.subscriptions.push(
+    vscode.window.onDidChangeVisibleTextEditors(refreshVisibleModifiers),
+    vscode.workspace.onDidChangeTextDocument((event) => {
+      if (isModuleStylesheet(event.document)) void refreshModifierDecorationsForDocument(event.document);
+    }),
+    stylesheetWatcher.onDidChange(refreshVisibleModifiers),
+    stylesheetWatcher.onDidCreate(refreshVisibleModifiers),
+    stylesheetWatcher.onDidDelete(refreshVisibleModifiers),
+  );
+  refreshVisibleModifiers();
   context.subscriptions.push({ dispose: () => void client?.stop() });
 }
 
@@ -108,4 +128,46 @@ interface ProtocolLocation {
     start: { line: number; character: number };
     end: { line: number; character: number };
   };
+}
+
+interface ModifierDecoration {
+  modifier: string;
+  requiredAll: string[];
+  range: ProtocolLocation['range'];
+  standalone: boolean;
+}
+
+async function refreshModifierDecorationsForDocument(document: vscode.TextDocument): Promise<void> {
+  for (const editor of vscode.window.visibleTextEditors) {
+    if (editor.document.uri.toString() === document.uri.toString()) await refreshModifierDecorations(editor);
+  }
+}
+
+async function refreshModifierDecorations(editor: vscode.TextEditor): Promise<void> {
+  if (!client || !modifierDecoration || !isModuleStylesheet(editor.document)) {
+    if (modifierDecoration) editor.setDecorations(modifierDecoration, []);
+    return;
+  }
+  let items: ModifierDecoration[];
+  try {
+    items = await client.sendRequest<ModifierDecoration[]>('stylebreeze/modifierDecorations', {
+      uri: editor.document.uri.toString(),
+    });
+  } catch {
+    return;
+  }
+  editor.setDecorations(
+    modifierDecoration,
+    items.map((item) => ({
+      range: new vscode.Range(
+        item.range.start.line,
+        item.range.start.character,
+        item.range.end.line,
+        item.range.end.character,
+      ),
+      hoverMessage: new vscode.MarkdownString(
+        `Modifier of ${item.requiredAll.map((name) => `\`.${name}\``).join(' or ')}${item.standalone ? ' (also usable independently)' : ''}`,
+      ),
+    })),
+  );
 }

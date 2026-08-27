@@ -44,12 +44,37 @@ pub struct TextEdit {
 struct Export {
     name: String,
     occurrences: Vec<Span>,
+    independent: bool,
 }
 #[derive(Clone, Debug)]
 struct Reference {
     module: PathBuf,
     name: String,
     span: Span,
+    composition: Option<Span>,
+    composition_certain: bool,
+}
+#[derive(Clone, Debug)]
+struct ModifierRule {
+    modifier: String,
+    required_all: Vec<String>,
+    modifier_span: Span,
+    base_spans: Vec<Span>,
+    selector: Span,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ModifierDecoration {
+    pub modifier: String,
+    pub required_all: Vec<String>,
+    pub range: Span,
+    pub selector: Span,
+    pub base_locations: Vec<Location>,
+    pub standalone: bool,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HoverInfo {
+    pub range: Span,
+    pub markdown: String,
 }
 #[derive(Clone, Debug)]
 struct ModuleImport {
@@ -65,6 +90,7 @@ struct FileRecord {
     imports: Vec<ModuleImport>,
     uncertain_modules: HashSet<PathBuf>,
     diagnostics: Vec<Diagnostic>,
+    modifier_rules: Vec<ModifierRule>,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -132,8 +158,10 @@ impl Project {
         let mut imports = Vec::new();
         let mut uncertain_modules = HashSet::new();
         let mut diagnostics = Vec::new();
+        let mut modifier_rules = Vec::new();
         if stylesheet(&path) {
             let facts = parse_stylesheet(&source);
+            let independent: HashSet<_> = facts.independent_classes.iter().cloned().collect();
             let mut by_name: HashMap<String, Vec<Span>> = HashMap::new();
             for c in facts
                 .classes
@@ -147,7 +175,35 @@ impl Project {
             }
             exports = by_name
                 .into_iter()
-                .map(|(name, occurrences)| Export { name, occurrences })
+                .map(|(name, occurrences)| Export {
+                    independent: independent.contains(&name),
+                    name,
+                    occurrences,
+                })
+                .collect();
+            modifier_rules = facts
+                .modifier_rules
+                .into_iter()
+                .map(|rule| ModifierRule {
+                    modifier: rule.modifier,
+                    required_all: rule.required_all,
+                    modifier_span: Span {
+                        start: rule.modifier_span.start,
+                        end: rule.modifier_span.end,
+                    },
+                    base_spans: rule
+                        .base_spans
+                        .into_iter()
+                        .map(|s| Span {
+                            start: s.start,
+                            end: s.end,
+                        })
+                        .collect(),
+                    selector: Span {
+                        start: rule.selector.start,
+                        end: rule.selector.end,
+                    },
+                })
                 .collect();
             for d in facts.diagnostics {
                 diagnostics.push(Diagnostic {
@@ -194,6 +250,11 @@ impl Project {
                                 start: a.span.start,
                                 end: a.span.end,
                             },
+                            composition: a.composition.map(|s| Span {
+                                start: s.start,
+                                end: s.end,
+                            }),
+                            composition_certain: a.composition_certain,
                         });
                     } else if a.kind == AccessKind::Dynamic {
                         dynamic.insert(a.binding);
@@ -231,6 +292,7 @@ impl Project {
                 imports,
                 uncertain_modules,
                 diagnostics,
+                modifier_rules,
             },
         );
     }
@@ -246,13 +308,85 @@ impl Project {
         self.files.remove(&canonical_or(path.to_path_buf()));
     }
     pub fn definition_at(&self, path: &Path, offset: usize) -> Option<Location> {
-        let (module, name) = self.symbol_at(path, offset)?;
-        let f = self.files.get(&module)?;
-        let e = f.exports.iter().find(|e| e.name == name)?;
-        Some(Location {
+        self.definitions_at(path, offset).into_iter().next()
+    }
+    pub fn definitions_at(&self, path: &Path, offset: usize) -> Vec<Location> {
+        let Some((module, name)) = self.symbol_at(path, offset) else {
+            return vec![];
+        };
+        let Some(f) = self.files.get(&module) else {
+            return vec![];
+        };
+        let Some(e) = f.exports.iter().find(|e| e.name == name) else {
+            return vec![];
+        };
+        let source_path = canonical_or(path.to_path_buf());
+        if source_path != module {
+            let Some(source_file) = self.files.get(&source_path) else {
+                return vec![];
+            };
+            let Some(reference) = source_file
+                .references
+                .iter()
+                .find(|r| inside(r.span, offset))
+            else {
+                return vec![];
+            };
+            let modifier_rules: Vec<_> = f
+                .modifier_rules
+                .iter()
+                .filter(|rule| rule.modifier == name)
+                .collect();
+            if modifier_rules.is_empty() {
+                return e
+                    .occurrences
+                    .first()
+                    .map(|span| {
+                        vec![Location {
+                            path: module,
+                            span: *span,
+                        }]
+                    })
+                    .unwrap_or_default();
+            }
+            let matched: Vec<_> = f
+                .modifier_rules
+                .iter()
+                .filter(|rule| {
+                    rule.modifier == name
+                        && self.reference_satisfies(source_file, reference, &rule.required_all)
+                })
+                .map(|rule| Location {
+                    path: module.clone(),
+                    span: rule.modifier_span,
+                })
+                .collect();
+            if !matched.is_empty() {
+                return matched;
+            }
+            if !e.independent {
+                return vec![];
+            }
+            let modifier_spans: HashSet<_> = f
+                .modifier_rules
+                .iter()
+                .filter(|r| r.modifier == name)
+                .map(|r| r.modifier_span)
+                .collect();
+            return e
+                .occurrences
+                .iter()
+                .filter(|s| !modifier_spans.contains(s))
+                .map(|s| Location {
+                    path: module.clone(),
+                    span: *s,
+                })
+                .collect();
+        }
+        vec![Location {
             path: module,
-            span: *e.occurrences.first()?,
-        })
+            span: *e.occurrences.first().unwrap(),
+        }]
     }
     pub fn references_at(
         &self,
@@ -264,6 +398,17 @@ impl Project {
             return vec![];
         };
         let mut out = Vec::new();
+        let source_path = canonical_or(path.to_path_buf());
+        let selected_rules: Vec<_> = if source_path == module {
+            self.files
+                .get(&module)
+                .into_iter()
+                .flat_map(|file| file.modifier_rules.iter())
+                .filter(|rule| inside(rule.modifier_span, offset))
+                .collect()
+        } else {
+            Vec::new()
+        };
         if include_declaration
             && let Some(f) = self.files.get(&module)
             && let Some(e) = f.exports.iter().find(|e| e.name == name)
@@ -277,7 +422,14 @@ impl Project {
             out.extend(
                 f.references
                     .iter()
-                    .filter(|r| r.module == module && r.name == name)
+                    .filter(|r| {
+                        r.module == module
+                            && r.name == name
+                            && (selected_rules.is_empty()
+                                || selected_rules
+                                    .iter()
+                                    .any(|rule| self.reference_satisfies(f, r, &rule.required_all)))
+                    })
                     .map(|r| Location {
                         path: p.clone(),
                         span: r.span,
@@ -345,6 +497,44 @@ impl Project {
                         message: format!("CSS Module has no export named '{}'", r.name),
                         unnecessary: false,
                     });
+                } else if let Some(module) = self.files.get(&r.module)
+                    && let Some(export) = module.exports.iter().find(|e| e.name == r.name)
+                    && !export.independent
+                {
+                    let rules: Vec<_> = module
+                        .modifier_rules
+                        .iter()
+                        .filter(|rule| rule.modifier == r.name)
+                        .collect();
+                    if !rules.is_empty()
+                        && r.composition_certain
+                        && r.composition.is_some()
+                        && !rules
+                            .iter()
+                            .any(|rule| self.reference_satisfies(f, r, &rule.required_all))
+                        && !rules
+                            .iter()
+                            .any(|rule| self.reference_may_share_root(f, r, &rule.required_all))
+                    {
+                        let alternatives = rules
+                            .iter()
+                            .map(|rule| rule.required_all.join(" + "))
+                            .collect::<Vec<_>>()
+                            .join(" or ");
+                        out.push(Diagnostic {
+                            location: Location {
+                                path: p.clone(),
+                                span: r.span,
+                            },
+                            severity: Severity::Warning,
+                            code: "dependent-modifier-without-base",
+                            message: format!(
+                                "Modifier '{}' requires {} in the same className composition",
+                                r.name, alternatives
+                            ),
+                            unnecessary: false,
+                        });
+                    }
                 }
             }
         }
@@ -410,6 +600,112 @@ impl Project {
         names.dedup();
         names
     }
+    pub fn modifier_decorations(&self, path: &Path) -> Vec<ModifierDecoration> {
+        let path = canonical_or(path.to_path_buf());
+        let Some(file) = self.files.get(&path) else {
+            return vec![];
+        };
+        let mut grouped: HashMap<(String, Span, Span), ModifierDecoration> = HashMap::new();
+        for rule in &file.modifier_rules {
+            let standalone = file
+                .exports
+                .iter()
+                .find(|e| e.name == rule.modifier)
+                .is_some_and(|e| e.independent);
+            let entry = grouped
+                .entry((rule.modifier.clone(), rule.modifier_span, rule.selector))
+                .or_insert_with(|| ModifierDecoration {
+                    modifier: rule.modifier.clone(),
+                    required_all: Vec::new(),
+                    range: rule.modifier_span,
+                    selector: rule.selector,
+                    base_locations: Vec::new(),
+                    standalone,
+                });
+            for required in &rule.required_all {
+                if !entry.required_all.contains(required) {
+                    entry.required_all.push(required.clone());
+                }
+            }
+            entry
+                .base_locations
+                .extend(rule.base_spans.iter().map(|span| Location {
+                    path: path.clone(),
+                    span: *span,
+                }));
+        }
+        let mut out: Vec<_> = grouped.into_values().collect();
+        for item in &mut out {
+            item.required_all.sort();
+            item.base_locations.sort_by_key(|l| l.span.start);
+            item.base_locations.dedup();
+        }
+        out.sort_by_key(|d| d.range.start);
+        out
+    }
+    pub fn hover_at(&self, path: &Path, offset: usize) -> Option<HoverInfo> {
+        let source_path = canonical_or(path.to_path_buf());
+        let (module, name) = self.symbol_at(&source_path, offset)?;
+        let module_file = self.files.get(&module)?;
+        let mut rules: Vec<_> = module_file
+            .modifier_rules
+            .iter()
+            .filter(|r| r.modifier == name)
+            .collect();
+        if source_path == module {
+            let occurrence_rules: Vec<_> = rules
+                .iter()
+                .copied()
+                .filter(|r| inside(r.modifier_span, offset))
+                .collect();
+            if occurrence_rules.is_empty() {
+                return None;
+            }
+            rules = occurrence_rules;
+        } else if let Some(source_file) = self.files.get(&source_path)
+            && let Some(reference) = source_file
+                .references
+                .iter()
+                .find(|r| inside(r.span, offset))
+        {
+            let matched: Vec<_> = rules
+                .iter()
+                .copied()
+                .filter(|r| self.reference_satisfies(source_file, reference, &r.required_all))
+                .collect();
+            if !matched.is_empty() {
+                rules = matched;
+            }
+        }
+        if rules.is_empty() {
+            return None;
+        }
+        let mut bases: Vec<_> = rules
+            .iter()
+            .flat_map(|r| r.required_all.iter().cloned())
+            .collect();
+        bases.sort();
+        bases.dedup();
+        let standalone = module_file
+            .exports
+            .iter()
+            .find(|e| e.name == name)
+            .is_some_and(|e| e.independent);
+        let requirement = bases
+            .iter()
+            .map(|b| format!("`.{b}`"))
+            .collect::<Vec<_>>()
+            .join(" or ");
+        let suffix = if standalone {
+            "\n\nAlso has independently applicable styles."
+        } else {
+            "\n\nHas no independently applicable selector in this module."
+        };
+        Some(HoverInfo {
+            range: self.span_at(&source_path, offset, &name)?,
+            markdown: format!("**Dependent modifier**\n\nRequires {requirement}.{suffix}"),
+        })
+    }
     pub fn file_paths(&self) -> impl Iterator<Item = &Path> {
         self.files.keys().map(PathBuf::as_path)
     }
@@ -422,6 +718,44 @@ impl Project {
         self.files
             .get(&canonical_or(path.to_path_buf()))
             .and_then(|f| f.version)
+    }
+    fn reference_satisfies(
+        &self,
+        file: &FileRecord,
+        reference: &Reference,
+        required: &[String],
+    ) -> bool {
+        let Some(composition) = reference.composition else {
+            return false;
+        };
+        required.iter().all(|name| {
+            file.references.iter().any(|candidate| {
+                candidate.module == reference.module
+                    && candidate.name == *name
+                    && candidate.composition.is_some_and(|candidate_composition| {
+                        span_contains(candidate_composition, composition)
+                    })
+            })
+        })
+    }
+    fn reference_may_share_root(
+        &self,
+        file: &FileRecord,
+        reference: &Reference,
+        required: &[String],
+    ) -> bool {
+        let Some(composition) = reference.composition else {
+            return false;
+        };
+        required.iter().all(|name| {
+            file.references.iter().any(|candidate| {
+                candidate.module == reference.module
+                    && candidate.name == *name
+                    && candidate.composition.is_some_and(|candidate_composition| {
+                        span_contains(composition, candidate_composition)
+                    })
+            })
+        })
     }
     fn symbol_at(&self, path: &Path, offset: usize) -> Option<(PathBuf, String)> {
         let p = canonical_or(path.to_path_buf());
@@ -462,6 +796,9 @@ impl Project {
 }
 fn inside(s: Span, o: usize) -> bool {
     o >= s.start && o <= s.end
+}
+fn span_contains(outer: Span, inner: Span) -> bool {
+    outer.start <= inner.start && outer.end >= inner.end
 }
 fn valid_name(s: &str) -> bool {
     !s.is_empty()
@@ -570,5 +907,72 @@ mod tests {
             Some(2),
         );
         assert!(p.diagnostics_for(&css).is_empty());
+    }
+
+    #[test]
+    fn pair_aware_modifier_navigation_and_diagnostics() {
+        let d = tempdir().unwrap();
+        let css = d.path().join("x.module.scss");
+        let ts = d.path().join("x.tsx");
+        fs::write(&css, ".first { &.active {} } .second { &.active {} }").unwrap();
+        fs::write(&ts, "import s from './x.module.scss'; <><i className={clsx(s.first, s.active)} /><i className={clsx(s.second, s.active)} /><i className={clsx(s.active)} /></>").unwrap();
+        let mut p = Project::new(vec![d.path().into()]);
+        p.index_workspace();
+        let ts_source = p.source(&ts).unwrap();
+        let first_active = ts_source.find("s.active").unwrap() + 2;
+        let second_active =
+            ts_source[first_active + 1..].find("s.active").unwrap() + first_active + 3;
+        let first_definition = p.definitions_at(&ts, first_active);
+        let second_definition = p.definitions_at(&ts, second_active);
+        assert_eq!(first_definition.len(), 1);
+        assert_eq!(second_definition.len(), 1);
+        assert_ne!(first_definition[0].span, second_definition[0].span);
+        let diagnostics = p.diagnostics_for(&ts);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|d| d.code == "dependent-modifier-without-base")
+                .count(),
+            1
+        );
+
+        let css_source = p.source(&css).unwrap();
+        let first_css_active = css_source.find("active").unwrap();
+        let usages = p.references_at(&css, first_css_active, false);
+        assert_eq!(usages.len(), 1);
+        assert_eq!(
+            &ts_source[usages[0].span.start..usages[0].span.end],
+            "active"
+        );
+    }
+
+    #[test]
+    fn standalone_modifier_is_valid_fallback() {
+        let d = tempdir().unwrap();
+        let css = d.path().join("x.module.scss");
+        let ts = d.path().join("x.tsx");
+        fs::write(&css, ".base { &.active {} } .active {}").unwrap();
+        fs::write(
+            &ts,
+            "import s from './x.module.scss'; <i className={s.active} />",
+        )
+        .unwrap();
+        let mut p = Project::new(vec![d.path().into()]);
+        p.index_workspace();
+        let source = p.source(&ts).unwrap();
+        let at = source.rfind("active").unwrap();
+        assert!(
+            p.diagnostics_for(&ts)
+                .iter()
+                .all(|d| d.code != "dependent-modifier-without-base")
+        );
+        let definitions = p.definitions_at(&ts, at);
+        assert_eq!(definitions.len(), 1);
+        let css_source = p.source(&css).unwrap();
+        assert_eq!(
+            &css_source[definitions[0].span.start..definitions[0].span.end],
+            "active"
+        );
+        assert!(definitions[0].span.start > css_source.find("&.active").unwrap());
     }
 }

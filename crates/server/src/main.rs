@@ -18,6 +18,7 @@ fn main() -> Result<()> {
     let capabilities = ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         definition_provider: Some(OneOf::Left(true)),
+        hover_provider: Some(HoverProviderCapability::Simple(true)),
         references_provider: Some(OneOf::Left(true)),
         completion_provider: Some(CompletionOptions {
             trigger_characters: Some(vec![".".into()]),
@@ -128,10 +129,14 @@ fn handle_request(c: &Connection, p: &Project, r: Request) -> Result<()> {
             let source = p.source(&path).unwrap_or("");
             let at =
                 position_to_offset(source, q.text_document_position_params.position).unwrap_or(0);
-            let loc = p
-                .definition_at(&path, at)
-                .and_then(|l| p.source(&l.path).and_then(|s| location_to_lsp(&l, s)));
-            Ok(serde_json::to_value(loc)?)
+            let locations: Vec<_> = p
+                .definitions_at(&path, at)
+                .into_iter()
+                .filter_map(|l| p.source(&l.path).and_then(|s| location_to_lsp(&l, s)))
+                .collect();
+            Ok(serde_json::to_value(GotoDefinitionResponse::Array(
+                locations,
+            ))?)
         }
         req::References::METHOD => {
             let q: ReferenceParams = serde_json::from_value(r.params)?;
@@ -179,6 +184,47 @@ fn handle_request(c: &Connection, p: &Project, r: Request) -> Result<()> {
                 })
                 .collect();
             Ok(serde_json::to_value(CompletionResponse::Array(items))?)
+        }
+        req::HoverRequest::METHOD => {
+            let q: HoverParams = serde_json::from_value(r.params)?;
+            let path = q
+                .text_document_position_params
+                .text_document
+                .uri
+                .to_file_path()
+                .map_err(|_| anyhow::anyhow!("invalid file URI"))?;
+            let source = p.source(&path).unwrap_or("");
+            let at =
+                position_to_offset(source, q.text_document_position_params.position).unwrap_or(0);
+            let hover = p.hover_at(&path, at).map(|info| Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: info.markdown,
+                }),
+                range: Some(span_to_range(source, info.range)),
+            });
+            Ok(serde_json::to_value(hover)?)
+        }
+        "stylebreeze/modifierDecorations" => {
+            let q: TextDocumentIdentifier = serde_json::from_value(r.params)?;
+            let path = q
+                .uri
+                .to_file_path()
+                .map_err(|_| anyhow::anyhow!("invalid file URI"))?;
+            let source = p.source(&path).unwrap_or("");
+            let items: Vec<_> = p.modifier_decorations(&path).into_iter().map(|item| {
+                serde_json::json!({
+                    "modifier": item.modifier,
+                    "requiredAll": item.required_all,
+                    "range": span_to_range(source, item.range),
+                    "selectorRange": span_to_range(source, item.selector),
+                    "baseLocations": item.base_locations.into_iter().filter_map(|location| {
+                        p.source(&location.path).and_then(|base_source| location_to_lsp(&location, base_source))
+                    }).collect::<Vec<_>>(),
+                    "standalone": item.standalone,
+                })
+            }).collect();
+            Ok(serde_json::to_value(items)?)
         }
         req::PrepareRenameRequest::METHOD => {
             let q: TextDocumentPositionParams = serde_json::from_value(r.params)?;

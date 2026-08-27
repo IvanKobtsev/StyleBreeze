@@ -15,5 +15,11 @@
         language="any"
         implementationClass="dev.stylebreeze.intellij.StyleBreezeCompletionContributor"
         order="first"/>
+    <codeInsight.lineMarkerProvider
+        language="CSS"
+        implementationClass="dev.stylebreeze.intellij.StyleBreezeModifierLineMarkerProvider"/>
+    <codeInsight.lineMarkerProvider
+        language="SCSS"
+        implementationClass="dev.stylebreeze.intellij.StyleBreezeModifierLineMarkerProvider"/>
   </extensions>
 </idea-plugin>

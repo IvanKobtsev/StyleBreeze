@@ -27,9 +27,20 @@ pub struct ParseDiagnostic {
     pub span: Span,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ModifierRule {
+    pub modifier: String,
+    pub required_all: Vec<String>,
+    pub modifier_span: Span,
+    pub base_spans: Vec<Span>,
+    pub selector: Span,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StylesheetFacts {
     pub classes: Vec<ClassOccurrence>,
+    pub modifier_rules: Vec<ModifierRule>,
+    pub independent_classes: Vec<String>,
     pub diagnostics: Vec<ParseDiagnostic>,
 }
 
@@ -174,7 +185,8 @@ pub fn parse_stylesheet(source: &str) -> StylesheetFacts {
     let mut facts = StylesheetFacts::default();
     let mut statement_start = 0usize;
     let mut i = 0usize;
-    let mut blocks: Vec<(Scope, Vec<String>)> = Vec::new();
+    let mut blocks: Vec<(Scope, Vec<(String, Span)>)> = Vec::new();
+    let mut direct_compounds: Vec<(Span, Vec<(String, Span)>)> = Vec::new();
     while i < bytes.len() {
         if skip_string_or_comment(bytes, &mut i) {
             continue;
@@ -201,7 +213,7 @@ pub fn parse_stylesheet(source: &str) -> StylesheetFacts {
                 facts.diagnostics.extend(diagnostics);
                 let parent_names = blocks.last().map(|b| b.1.clone()).unwrap_or_default();
                 if trimmed.contains('&') {
-                    for parent in &parent_names {
+                    for (parent, _) in &parent_names {
                         for suffix in amp_suffixes(trimmed) {
                             let name = format!("{parent}{suffix}");
                             if !classes.iter().any(|c| c.name == name) {
@@ -221,16 +233,42 @@ pub fn parse_stylesheet(source: &str) -> StylesheetFacts {
                         }
                     }
                 }
-                let names = classes
-                    .iter()
-                    .filter(|c| c.scope == Scope::Local)
-                    .map(|c| c.name.clone())
-                    .collect();
+                let child_bases = if !trimmed.contains('&') {
+                    simple_compound_branches(source, selector, &classes)
+                        .filter(|branches| branches.iter().all(|branch| branch.len() == 1))
+                        .map(|branches| branches.into_iter().flatten().collect())
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                if let Some(modifier) = simple_nested_modifier(trimmed, &classes) {
+                    for (base, base_span) in &parent_names {
+                        if base != &modifier.name {
+                            facts.modifier_rules.push(ModifierRule {
+                                modifier: modifier.name.clone(),
+                                required_all: vec![base.clone()],
+                                modifier_span: modifier.span,
+                                base_spans: vec![*base_span],
+                                selector,
+                            });
+                        }
+                    }
+                } else if !trimmed.contains('&')
+                    && let Some(branches) = simple_compound_branches(source, selector, &classes)
+                {
+                    for branch in branches {
+                        if branch.len() == 1 {
+                            facts.independent_classes.push(branch[0].0.clone());
+                        } else if branch.len() == 2 {
+                            direct_compounds.push((selector, branch));
+                        }
+                    }
+                }
                 for class in &mut classes {
                     class.declaration = class.scope == Scope::Local;
                 }
                 facts.classes.extend(classes);
-                blocks.push((block_scope, names));
+                blocks.push((block_scope, child_bases));
                 statement_start = i + 1;
             }
             b'}' => {
@@ -244,7 +282,108 @@ pub fn parse_stylesheet(source: &str) -> StylesheetFacts {
         }
         i += 1;
     }
+    facts.independent_classes.sort();
+    facts.independent_classes.dedup();
+    for (selector, classes) in direct_compounds {
+        let first_independent = facts.independent_classes.contains(&classes[0].0);
+        let second_independent = facts.independent_classes.contains(&classes[1].0);
+        let (base, modifier) = match (first_independent, second_independent) {
+            (true, _) => (&classes[0], &classes[1]),
+            (false, true) => (&classes[1], &classes[0]),
+            _ => continue,
+        };
+        facts.modifier_rules.push(ModifierRule {
+            modifier: modifier.0.clone(),
+            required_all: vec![base.0.clone()],
+            modifier_span: modifier.1,
+            base_spans: vec![base.1],
+            selector,
+        });
+    }
     facts
+}
+
+fn simple_nested_modifier<'a>(
+    selector: &str,
+    classes: &'a [ClassOccurrence],
+) -> Option<&'a ClassOccurrence> {
+    let trimmed = selector.trim();
+    if !trimmed.starts_with('&')
+        || trimmed.matches('&').count() != 1
+        || trimmed.contains(',')
+        || contains_deferred_selector_syntax(trimmed)
+    {
+        return None;
+    }
+    let locals: Vec<_> = classes.iter().filter(|c| c.scope == Scope::Local).collect();
+    (locals.len() == 1).then_some(locals[0])
+}
+
+fn simple_compound_branches(
+    source: &str,
+    selector: Span,
+    classes: &[ClassOccurrence],
+) -> Option<Vec<Vec<(String, Span)>>> {
+    let text = &source[selector.start..selector.end];
+    if contains_deferred_selector_syntax(text) {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut start = selector.start;
+    for part in text.split(',') {
+        let end = start + part.len();
+        let trimmed = part.trim();
+        if trimmed.contains('&') || has_top_level_combinator(trimmed) {
+            return None;
+        }
+        let branch: Vec<_> = classes
+            .iter()
+            .filter(|c| c.scope == Scope::Local && c.span.start >= start && c.span.end <= end)
+            .map(|c| (c.name.clone(), c.span))
+            .collect();
+        if branch.is_empty() || branch.len() > 2 {
+            return None;
+        }
+        out.push(branch);
+        start = end + 1;
+    }
+    Some(out)
+}
+
+fn contains_deferred_selector_syntax(selector: &str) -> bool {
+    selector.contains(":is(")
+        || selector.contains(":where(")
+        || selector.contains(":not(")
+        || selector.contains(":has(")
+        || selector.contains(":global")
+        || selector.contains(":local")
+        || selector.contains("#{")
+}
+
+fn has_top_level_combinator(selector: &str) -> bool {
+    let bytes = selector.as_bytes();
+    let mut bracket_depth = 0usize;
+    let mut paren_depth = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'[' => bracket_depth += 1,
+            b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            b'(' => paren_depth += 1,
+            b')' => paren_depth = paren_depth.saturating_sub(1),
+            b'>' | b'+' | b'~' if bracket_depth == 0 && paren_depth == 0 => return true,
+            b if b.is_ascii_whitespace() && bracket_depth == 0 && paren_depth == 0 => {
+                let before = selector[..i].trim_end();
+                let after = selector[i..].trim_start();
+                if !before.is_empty() && !after.is_empty() {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 fn amp_suffixes(selector: &str) -> Vec<&str> {
@@ -288,6 +427,36 @@ mod tests {
         let f = parse_stylesheet(".parent { &__child {} &:where(.active) {} }");
         assert!(f.classes.iter().any(|c| c.name == "parent__child"));
         assert!(f.classes.iter().any(|c| c.name == "active"));
+    }
+    #[test]
+    fn infers_pair_aware_nested_modifiers() {
+        let f = parse_stylesheet(
+            ".first { &.active {} } .second { &.active {} } .active { color: red; }",
+        );
+        let pairs: Vec<_> = f
+            .modifier_rules
+            .iter()
+            .map(|r| (r.modifier.as_str(), r.required_all[0].as_str()))
+            .collect();
+        assert_eq!(pairs, [("active", "first"), ("active", "second")]);
+        assert!(f.independent_classes.contains(&"active".into()));
+    }
+
+    #[test]
+    fn selector_list_creates_alternative_modifier_rules() {
+        let f = parse_stylesheet(".first, .second { &.active:hover {} }");
+        assert_eq!(f.modifier_rules.len(), 2);
+        assert_eq!(f.modifier_rules[0].required_all, ["first"]);
+        assert_eq!(f.modifier_rules[1].required_all, ["second"]);
+    }
+
+    #[test]
+    fn direct_compound_uses_independent_base() {
+        let f = parse_stylesheet(".base {} .active {} .base.active {}");
+        assert_eq!(f.modifier_rules.len(), 1);
+        assert_eq!(f.modifier_rules[0].modifier, "active");
+        assert_eq!(f.modifier_rules[0].required_all, ["base"]);
+        assert!(f.independent_classes.contains(&"active".into()));
     }
     #[test]
     fn fixture_corpus_matches_expected_scope() {
