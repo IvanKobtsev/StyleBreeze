@@ -205,6 +205,24 @@ fn handle_request(c: &Connection, p: &Project, r: Request) -> Result<()> {
             });
             Ok(serde_json::to_value(hover)?)
         }
+        "stylebreeze/selectorPreview" => {
+            let q: TextDocumentPositionParams = serde_json::from_value(r.params)?;
+            let path = q
+                .text_document
+                .uri
+                .to_file_path()
+                .map_err(|_| anyhow::anyhow!("invalid file URI"))?;
+            let source = p.source(&path).unwrap_or("");
+            let at = position_to_offset(source, q.position).unwrap_or(0);
+            let response = p.selector_preview_at(&path, at).map(|info| {
+                serde_json::json!({
+                    "range": span_to_range(source, info.range),
+                    "preview": info.preview,
+                    "unsupported": info.unsupported,
+                })
+            });
+            Ok(serde_json::to_value(response)?)
+        }
         "stylebreeze/modifierDecorations" => {
             let q: TextDocumentIdentifier = serde_json::from_value(r.params)?;
             let path = q

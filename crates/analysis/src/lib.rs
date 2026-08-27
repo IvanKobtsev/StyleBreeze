@@ -5,7 +5,9 @@ use std::{
     path::{Path, PathBuf},
 };
 use stylebreeze_resolver::{FileSystemResolver, Resolver};
-use stylebreeze_stylesheet_parser::{Scope, parse_stylesheet};
+use stylebreeze_stylesheet_parser::{
+    Scope, SelectorPreview, SelectorRule, UnsupportedReason, parse_stylesheet, preview_selector,
+};
 use stylebreeze_typescript_parser::{AccessKind, parse_typescript};
 use thiserror::Error;
 use walkdir::WalkDir;
@@ -80,6 +82,13 @@ pub struct HoverInfo {
     pub range: Span,
     pub markdown: String,
 }
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectorPreviewInfo {
+    pub range: Span,
+    pub preview: Option<SelectorPreview>,
+    pub unsupported: Option<UnsupportedReason>,
+}
 #[derive(Clone, Debug)]
 struct ModuleImport {
     binding: String,
@@ -95,6 +104,7 @@ struct FileRecord {
     uncertain_modules: HashSet<PathBuf>,
     diagnostics: Vec<Diagnostic>,
     modifier_rules: Vec<ModifierRule>,
+    selectors: Vec<SelectorRule>,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -163,8 +173,10 @@ impl Project {
         let mut uncertain_modules = HashSet::new();
         let mut diagnostics = Vec::new();
         let mut modifier_rules = Vec::new();
+        let mut selectors = Vec::new();
         if stylesheet(&path) {
             let facts = parse_stylesheet(&source);
+            selectors = facts.selectors.clone();
             let independent: HashSet<_> = facts.independent_classes.iter().cloned().collect();
             let mut by_name: HashMap<String, Vec<Span>> = HashMap::new();
             for c in facts
@@ -297,6 +309,7 @@ impl Project {
                 uncertain_modules,
                 diagnostics,
                 modifier_rules,
+                selectors,
             },
         );
     }
@@ -792,6 +805,29 @@ impl Project {
             markdown: format!("**Dependent modifier**\n\nRequires {requirement}.{suffix}"),
         })
     }
+    pub fn selector_preview_at(&self, path: &Path, offset: usize) -> Option<SelectorPreviewInfo> {
+        let file = self.files.get(&canonical_or(path.to_path_buf()))?;
+        let rule = file
+            .selectors
+            .iter()
+            .find(|rule| rule.source_span.start <= offset && offset <= rule.source_span.end)?;
+        let range = Span {
+            start: rule.source_span.start,
+            end: rule.source_span.end,
+        };
+        match preview_selector(&rule.resolved) {
+            Ok(preview) => Some(SelectorPreviewInfo {
+                range,
+                preview: Some(preview),
+                unsupported: None,
+            }),
+            Err(reason) => Some(SelectorPreviewInfo {
+                range,
+                preview: None,
+                unsupported: Some(reason),
+            }),
+        }
+    }
     pub fn file_paths(&self) -> impl Iterator<Item = &Path> {
         self.files.keys().map(PathBuf::as_path)
     }
@@ -1109,6 +1145,28 @@ mod tests {
             diagnostic.code == "dependent-modifier-without-base"
                 && diagnostic.message.contains("gradientWrapper + offset")
         }));
+    }
+
+    #[test]
+    fn selector_preview_is_available_across_nested_selector_span() {
+        let d = tempdir().unwrap();
+        let css = d.path().join("x.module.scss");
+        let source = ".searchWrapper { &:has(+ .popup:popover-open) .arrow {} }";
+        fs::write(&css, source).unwrap();
+        let mut project = Project::new(vec![d.path().into()]);
+        project.index_workspace();
+        let at = source.find("popover-open").unwrap();
+        let info = project.selector_preview_at(&css, at).unwrap();
+        let preview = info.preview.unwrap();
+        assert_eq!(
+            preview.resolved_selector,
+            ".searchWrapper:has(+ .popup:popover-open) .arrow"
+        );
+        assert!(
+            preview.nodes[preview.subject]
+                .classes
+                .contains(&"arrow".into())
+        );
     }
 
     #[test]

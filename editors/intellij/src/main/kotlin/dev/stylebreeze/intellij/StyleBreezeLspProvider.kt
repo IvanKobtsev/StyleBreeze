@@ -37,6 +37,9 @@ private class StyleBreezeDescriptor(project: Project) :
 
     override val lspCustomization: LspCustomization = StyleBreezeLspCustomization
 
+    override val lsp4jServerClass: Class<out org.eclipse.lsp4j.services.LanguageServer>
+        get() = StyleBreezeLanguageServer::class.java
+
 }
 
 private object StyleBreezeLspCustomization : LspCustomization() {

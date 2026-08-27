@@ -18,5 +18,11 @@
     <codeInsight.lineMarkerProvider
         language="CSS"
         implementationClass="dev.stylebreeze.intellij.StyleBreezeModifierLineMarkerProvider"/>
+    <lang.documentationProvider
+        language="CSS"
+        implementationClass="dev.stylebreeze.intellij.StyleBreezeSelectorDocumentationProvider"/>
+    <lang.documentationProvider
+        language="SCSS"
+        implementationClass="dev.stylebreeze.intellij.StyleBreezeSelectorDocumentationProvider"/>
   </extensions>
 </idea-plugin>

@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
 
+mod selector_preview;
+pub use selector_preview::{
+    NodeRole, PreviewAttribute, PreviewNode, Relationship, RelationshipKind, SelectorPreview,
+    SelectorRule, StateRequirement, UnsupportedReason, preview_selector,
+};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Span {
     pub start: usize,
@@ -42,6 +48,7 @@ pub struct StylesheetFacts {
     pub modifier_rules: Vec<ModifierRule>,
     pub independent_classes: Vec<String>,
     pub diagnostics: Vec<ParseDiagnostic>,
+    pub selectors: Vec<SelectorRule>,
 }
 
 struct BlockContext {
@@ -348,6 +355,7 @@ pub fn parse_stylesheet(source: &str) -> StylesheetFacts {
             selector,
         });
     }
+    facts.selectors = selector_preview::collect_selector_rules(source);
     facts
 }
 
