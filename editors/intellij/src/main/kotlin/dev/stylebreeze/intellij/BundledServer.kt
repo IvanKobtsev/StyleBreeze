@@ -11,6 +11,7 @@ internal object BundledServer {
         val os = System.getProperty("os.name").lowercase()
         val arch = System.getProperty("os.arch").lowercase()
         val platform = when {
+            os.contains("win") && arch in setOf("aarch64", "arm64") -> "windows-arm64/stylebreeze.exe"
             os.contains("win") -> "windows-x64/stylebreeze.exe"
             os.contains("mac") && arch.contains("aarch64") -> "macos-arm64/stylebreeze"
             os.contains("mac") -> "macos-x64/stylebreeze"

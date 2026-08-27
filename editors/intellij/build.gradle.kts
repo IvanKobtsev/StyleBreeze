@@ -27,3 +27,27 @@ intellijPlatform {
 }
 
 tasks.test { useJUnitPlatform() }
+
+val verifyBundledBinaries by tasks.registering {
+    dependsOn(tasks.named("buildPlugin"))
+    doLast {
+        val archive = tasks.named<Zip>("buildPlugin").get().archiveFile.get().asFile
+        val entries = mutableSetOf<String>()
+        zipTree(archive).visit {
+            if (!isDirectory) entries += relativePath.pathString.replace('\\', '/')
+        }
+        val expected = mapOf(
+            "windows-x64" to "stylebreeze.exe",
+            "windows-arm64" to "stylebreeze.exe",
+            "macos-x64" to "stylebreeze",
+            "macos-arm64" to "stylebreeze",
+            "linux-x64" to "stylebreeze",
+            "linux-arm64" to "stylebreeze",
+        )
+        for ((platform, binary) in expected) {
+            check(entries.any { it.endsWith("/bin/$platform/$binary") }) {
+                "Plugin archive is missing executable: bin/$platform/$binary"
+            }
+        }
+    }
+}
