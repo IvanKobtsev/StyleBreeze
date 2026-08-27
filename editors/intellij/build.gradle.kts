@@ -1,4 +1,4 @@
-import dev.stylebreeze.build.VerifyPluginBinaries
+import dev.stylebreeze.gradle.VerifyPluginBinaries
 
 plugins {
     kotlin("jvm") version "2.4.0"
