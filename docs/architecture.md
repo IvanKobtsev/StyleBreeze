@@ -21,4 +21,4 @@ namespace bindings, dot and literal bracket access, modern selector functions,
 CSS Modules scope, basic Sass nesting, navigation, references, diagnostics, and
 safe rename. Sass graphs, interpolation evaluation, naming conventions, ICSS,
 completion, unused exports, hover, and CodeLens are intentionally deferred.
-
+ 
