@@ -372,8 +372,7 @@ mod tests {
         let alternate_base = conditional
             .accesses
             .iter()
-            .filter(|a| a.class_name.as_deref() == Some("base"))
-            .last()
+            .rfind(|a| a.class_name.as_deref() == Some("base"))
             .unwrap();
         assert_ne!(active.composition, alternate_base.composition);
 
