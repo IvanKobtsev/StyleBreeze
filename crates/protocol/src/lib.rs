@@ -1,5 +1,6 @@
 use lsp_types::{
-    Diagnostic as LspDiagnostic, DiagnosticSeverity, Location as LspLocation, Position, Range, Url,
+    Diagnostic as LspDiagnostic, DiagnosticSeverity, DiagnosticTag, Location as LspLocation,
+    Position, Range, Url,
 };
 use stylebreeze_analysis::{Diagnostic, Location, Severity, Span};
 
@@ -52,23 +53,42 @@ pub fn diagnostic_to_lsp(d: &Diagnostic, source: &str) -> LspDiagnostic {
             Severity::Error => DiagnosticSeverity::ERROR,
             Severity::Warning => DiagnosticSeverity::WARNING,
             Severity::Information => DiagnosticSeverity::INFORMATION,
+            Severity::Hint => DiagnosticSeverity::HINT,
         }),
         code: Some(lsp_types::NumberOrString::String(d.code.into())),
         code_description: None,
         source: Some("stylebreeze".into()),
         message: d.message.clone(),
         related_information: None,
-        tags: None,
+        tags: d.unnecessary.then(|| vec![DiagnosticTag::UNNECESSARY]),
         data: None,
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     #[test]
     fn utf16_positions() {
         let s = "a😀b\nç";
         assert_eq!(position_to_offset(s, Position::new(0, 3)), Some(5));
         assert_eq!(offset_to_position(s, 5), Position::new(0, 3));
+    }
+
+    #[test]
+    fn unused_diagnostics_have_the_unnecessary_tag() {
+        let diagnostic = Diagnostic {
+            location: Location {
+                path: PathBuf::from("x.module.scss"),
+                span: Span { start: 1, end: 7 },
+            },
+            severity: Severity::Hint,
+            code: "unused-export",
+            message: "unused".into(),
+            unnecessary: true,
+        };
+        let lsp = diagnostic_to_lsp(&diagnostic, ".unused {}");
+        assert_eq!(lsp.severity, Some(DiagnosticSeverity::HINT));
+        assert_eq!(lsp.tags, Some(vec![DiagnosticTag::UNNECESSARY]));
     }
 }

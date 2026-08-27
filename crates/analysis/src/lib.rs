@@ -25,6 +25,7 @@ pub enum Severity {
     Error,
     Warning,
     Information,
+    Hint,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Diagnostic {
@@ -32,6 +33,7 @@ pub struct Diagnostic {
     pub severity: Severity,
     pub code: &'static str,
     pub message: String,
+    pub unnecessary: bool,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TextEdit {
@@ -61,6 +63,7 @@ struct FileRecord {
     exports: Vec<Export>,
     references: Vec<Reference>,
     imports: Vec<ModuleImport>,
+    uncertain_modules: HashSet<PathBuf>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -127,6 +130,7 @@ impl Project {
         let mut exports = Vec::new();
         let mut references = Vec::new();
         let mut imports = Vec::new();
+        let mut uncertain_modules = HashSet::new();
         let mut diagnostics = Vec::new();
         if stylesheet(&path) {
             let facts = parse_stylesheet(&source);
@@ -157,6 +161,7 @@ impl Project {
                     severity: Severity::Information,
                     code: "unresolved-sass-interpolation",
                     message: d.message,
+                    unnecessary: false,
                 });
             }
         } else {
@@ -205,10 +210,16 @@ impl Project {
                             message:
                                 "Dynamic CSS Module access cannot be resolved to a specific export"
                                     .into(),
+                            unnecessary: false,
                         });
                     }
                 }
             }
+            uncertain_modules.extend(
+                dynamic
+                    .into_iter()
+                    .filter_map(|binding| resolved_imports.get(&binding).cloned()),
+            );
         }
         self.files.insert(
             path,
@@ -218,6 +229,7 @@ impl Project {
                 exports,
                 references,
                 imports,
+                uncertain_modules,
                 diagnostics,
             },
         );
@@ -331,7 +343,38 @@ impl Project {
                         severity: Severity::Warning,
                         code: "unknown-export",
                         message: format!("CSS Module has no export named '{}'", r.name),
+                        unnecessary: false,
                     });
+                }
+            }
+        }
+        if let Some(f) = self.files.get(&p)
+            && stylesheet(&p)
+        {
+            let usage_is_uncertain = self
+                .files
+                .values()
+                .any(|candidate| candidate.uncertain_modules.contains(&p));
+            if !usage_is_uncertain {
+                for export in &f.exports {
+                    let used = self.files.values().any(|candidate| {
+                        candidate
+                            .references
+                            .iter()
+                            .any(|reference| reference.module == p && reference.name == export.name)
+                    });
+                    if !used {
+                        out.extend(export.occurrences.iter().map(|span| Diagnostic {
+                            location: Location {
+                                path: p.clone(),
+                                span: *span,
+                            },
+                            severity: Severity::Hint,
+                            code: "unused-export",
+                            message: format!("CSS Module export '{}' is unused", export.name),
+                            unnecessary: true,
+                        }));
+                    }
                 }
             }
         }
@@ -503,5 +546,29 @@ mod tests {
         let completion_offset =
             p.source(&ts).unwrap().find("styles.myClass").unwrap() + "styles.".len();
         assert_eq!(p.completions_at(&ts, completion_offset), ["myClass"]);
+    }
+
+    #[test]
+    fn reports_unused_exports_but_not_for_dynamic_module_access() {
+        let d = tempdir().unwrap();
+        let css = d.path().join("x.module.scss");
+        let ts = d.path().join("x.tsx");
+        fs::write(&css, ".used {} .unused {}").unwrap();
+        fs::write(&ts, "import styles from './x.module.scss'; styles.used;").unwrap();
+
+        let mut p = Project::new(vec![d.path().into()]);
+        p.index_workspace();
+        let diagnostics = p.diagnostics_for(&css);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "unused-export");
+        assert_eq!(diagnostics[0].severity, Severity::Hint);
+        assert!(diagnostics[0].unnecessary);
+
+        p.open_or_update_file(
+            ts,
+            "import styles from './x.module.scss'; styles[name];".into(),
+            Some(2),
+        );
+        assert!(p.diagnostics_for(&css).is_empty());
     }
 }
