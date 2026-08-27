@@ -315,8 +315,9 @@ fn simple_nested_modifier<'a>(
     {
         return None;
     }
-    let locals: Vec<_> = classes.iter().filter(|c| c.scope == Scope::Local).collect();
-    (locals.len() == 1).then_some(locals[0])
+    let mut locals = classes.iter().filter(|c| c.scope == Scope::Local);
+    let modifier = locals.next()?;
+    locals.next().is_none().then_some(modifier)
 }
 
 fn simple_compound_branches(
@@ -448,6 +449,12 @@ mod tests {
         assert_eq!(f.modifier_rules.len(), 2);
         assert_eq!(f.modifier_rules[0].required_all, ["first"]);
         assert_eq!(f.modifier_rules[1].required_all, ["second"]);
+    }
+
+    #[test]
+    fn nested_selector_without_local_class_does_not_panic() {
+        let f = parse_stylesheet(".button { &:hover {} &[disabled] {} & > span {} }");
+        assert!(f.modifier_rules.is_empty());
     }
 
     #[test]
