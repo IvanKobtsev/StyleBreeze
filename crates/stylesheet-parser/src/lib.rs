@@ -481,7 +481,7 @@ fn collect_custom_property_facts(source: &str, facts: &mut StylesheetFacts) {
             }
             continue;
         }
-        if source[i..].starts_with("var(") {
+        if bytes.get(i..i + 4) == Some(b"var(") {
             let mut j = i + 4;
             while j < bytes.len() && bytes[j].is_ascii_whitespace() {
                 j += 1;
@@ -765,6 +765,23 @@ mod tests {
         );
         assert_eq!(facts.property_annotations.imports[0].names[0].0, "--brand");
         assert_eq!(facts.property_annotations.exports[0].0, "--runtime");
+    }
+    #[test]
+    fn custom_property_scanner_is_safe_for_bom_and_unicode() {
+        let source = "\u{feff}.café { --цвет: red; color: var(--цвет); content: \"😀\"; }";
+        let facts = parse_stylesheet(source);
+        assert!(
+            facts
+                .custom_property_declarations
+                .iter()
+                .any(|d| d.name == "--цвет")
+        );
+        assert!(
+            facts
+                .custom_property_references
+                .iter()
+                .any(|r| r.name == "--цвет")
+        );
     }
     #[test]
     fn functional_scope() {
