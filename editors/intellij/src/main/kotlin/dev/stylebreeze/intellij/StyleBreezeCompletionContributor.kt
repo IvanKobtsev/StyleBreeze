@@ -39,7 +39,7 @@ class StyleBreezeCompletionContributor : CompletionContributor() {
             if (items.isEmpty()) continue
             items.distinctBy { it.label }.forEach { item ->
                 val lookup = LookupElementBuilder.create(item.label)
-                    .withTypeText("StyleBreeze CSS Module", true)
+                    .withTypeText(if (item.label.startsWith("--")) "StyleBreeze custom property" else "StyleBreeze CSS Module", true)
                 result.addElement(PrioritizedLookupElement.withPriority(lookup, PRIORITY))
             }
             // StyleBreeze knows the exact module at this member access, so avoid

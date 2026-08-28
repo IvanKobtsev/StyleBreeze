@@ -34,6 +34,38 @@ pub struct ParseDiagnostic {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CustomPropertyDeclaration {
+    pub name: String,
+    pub span: Span,
+    pub selector: Option<String>,
+    pub registered: bool,
+    pub syntax: Option<String>,
+    pub inherits: Option<bool>,
+    pub initial_value: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CustomPropertyReference {
+    pub name: String,
+    pub span: Span,
+    pub line: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PropertyImport {
+    pub path: String,
+    pub path_span: Span,
+    pub names: Vec<(String, Span)>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PropertyAnnotations {
+    pub imports: Vec<PropertyImport>,
+    pub exports: Vec<(String, Span)>,
+    pub suppress_next_lines: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ModifierRule {
     pub modifier: String,
     pub required_all: Vec<String>,
@@ -49,6 +81,9 @@ pub struct StylesheetFacts {
     pub independent_classes: Vec<String>,
     pub diagnostics: Vec<ParseDiagnostic>,
     pub selectors: Vec<SelectorRule>,
+    pub custom_property_declarations: Vec<CustomPropertyDeclaration>,
+    pub custom_property_references: Vec<CustomPropertyReference>,
+    pub property_annotations: PropertyAnnotations,
 }
 
 struct BlockContext {
@@ -356,7 +391,238 @@ pub fn parse_stylesheet(source: &str) -> StylesheetFacts {
         });
     }
     facts.selectors = selector_preview::collect_selector_rules(source);
+    collect_custom_property_facts(source, &mut facts);
     facts
+}
+
+fn collect_custom_property_facts(source: &str, facts: &mut StylesheetFacts) {
+    let bytes = source.as_bytes();
+    let mut i = 0;
+    let mut statement_start = 0;
+    let mut block_selectors: Vec<String> = Vec::new();
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            let start = i;
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            let end = (i + 2).min(bytes.len());
+            parse_property_annotation(source, start, end, facts);
+            i = end;
+            continue;
+        }
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            i += 2;
+            while i < bytes.len() && !matches!(bytes[i], b'\r' | b'\n') {
+                i += 1;
+            }
+            continue;
+        }
+        if matches!(bytes[i], b'\'' | b'"') {
+            let quote = bytes[i];
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    i += 2;
+                } else if bytes[i] == quote {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if bytes[i] == b'{' {
+            let head = source[statement_start..i].trim().to_string();
+            block_selectors.push(head);
+            statement_start = i + 1;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'}' {
+            block_selectors.pop();
+            statement_start = i + 1;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b';' {
+            statement_start = i + 1;
+            i += 1;
+            continue;
+        }
+        if i + 2 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            let start = i;
+            i += 2;
+            while i < bytes.len() && ident_byte(bytes[i]) {
+                i += 1;
+            }
+            let end = i;
+            let mut j = i;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if end > start + 2 && j < bytes.len() && bytes[j] == b':' {
+                let registered = block_selectors
+                    .last()
+                    .is_some_and(|s| s.trim_start().starts_with("@property "));
+                facts
+                    .custom_property_declarations
+                    .push(CustomPropertyDeclaration {
+                        name: source[start..end].into(),
+                        span: Span { start, end },
+                        selector: block_selectors.last().cloned(),
+                        registered,
+                        syntax: None,
+                        inherits: None,
+                        initial_value: None,
+                    });
+            }
+            continue;
+        }
+        if source[i..].starts_with("var(") {
+            let mut j = i + 4;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j + 2 <= bytes.len() && &source[j..j + 2] == "--" {
+                let start = j;
+                j += 2;
+                while j < bytes.len() && ident_byte(bytes[j]) {
+                    j += 1;
+                }
+                if j > start + 2 {
+                    facts
+                        .custom_property_references
+                        .push(CustomPropertyReference {
+                            name: source[start..j].into(),
+                            span: Span { start, end: j },
+                            line: source[..start].bytes().filter(|b| *b == b'\n').count(),
+                        });
+                }
+            }
+        }
+        i += 1;
+    }
+    // Turn @property block headers into registrations and attach simple descriptors.
+    for selector in block_selectors {
+        let _ = selector;
+    }
+    let mut cursor = 0;
+    while let Some(relative) = source[cursor..].find("@property") {
+        let at = cursor + relative;
+        let mut p = at + "@property".len();
+        while p < bytes.len() && bytes[p].is_ascii_whitespace() {
+            p += 1;
+        }
+        if p + 2 <= bytes.len() && &source[p..p + 2] == "--" {
+            let start = p;
+            p += 2;
+            while p < bytes.len() && ident_byte(bytes[p]) {
+                p += 1;
+            }
+            if let Some(open_rel) = source[p..].find('{') {
+                let open = p + open_rel;
+                if let Some(close_rel) = source[open + 1..].find('}') {
+                    let body = &source[open + 1..open + 1 + close_rel];
+                    facts
+                        .custom_property_declarations
+                        .push(CustomPropertyDeclaration {
+                            name: source[start..p].into(),
+                            span: Span { start, end: p },
+                            selector: None,
+                            registered: true,
+                            syntax: descriptor(body, "syntax"),
+                            inherits: descriptor(body, "inherits").and_then(|v| v.parse().ok()),
+                            initial_value: descriptor(body, "initial-value"),
+                        });
+                }
+            }
+        }
+        cursor = p.max(at + 1);
+    }
+}
+
+fn descriptor(body: &str, name: &str) -> Option<String> {
+    body.split(';').find_map(|part| {
+        let (key, value) = part.split_once(':')?;
+        (key.trim() == name).then(|| value.trim().trim_matches(['"', '\'']).to_string())
+    })
+}
+
+fn parse_property_annotation(source: &str, start: usize, end: usize, facts: &mut StylesheetFacts) {
+    let text = &source[start..end];
+    if let Some(pos) = text.find("@suppress-unresolved-prop") {
+        let line = source[..start + pos]
+            .bytes()
+            .filter(|b| *b == b'\n')
+            .count();
+        facts
+            .property_annotations
+            .suppress_next_lines
+            .push(line + 1);
+    }
+    if let Some(pos) = text.find("@export-props")
+        && let Some((_, list)) = text[pos..].split_once(':')
+    {
+        collect_annotation_names(
+            source,
+            start + pos + text[pos..].find(':').unwrap() + 1,
+            list,
+            &mut facts.property_annotations.exports,
+        );
+    }
+    if let Some(pos) = text.find("@import-props") {
+        let tail = &text[pos + "@import-props".len()..];
+        let Some(q) = tail.find(['"', '\'']) else {
+            return;
+        };
+        let quote = tail.as_bytes()[q];
+        let Some(q2) = tail[q + 1..].bytes().position(|b| b == quote) else {
+            return;
+        };
+        let path_start = start + pos + "@import-props".len() + q + 1;
+        let path_end = path_start + q2;
+        let after = &source[path_end + 1..end];
+        let Some(colon) = after.find(':') else {
+            return;
+        };
+        let list_start = path_end + 1 + colon + 1;
+        let mut names = Vec::new();
+        collect_annotation_names(source, list_start, &source[list_start..end], &mut names);
+        facts.property_annotations.imports.push(PropertyImport {
+            path: source[path_start..path_end].into(),
+            path_span: Span {
+                start: path_start,
+                end: path_end,
+            },
+            names,
+        });
+    }
+}
+
+fn collect_annotation_names(source: &str, base: usize, text: &str, out: &mut Vec<(String, Span)>) {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + 2 <= bytes.len() {
+        if bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            let start = i;
+            i += 2;
+            while i < bytes.len() && ident_byte(bytes[i]) {
+                i += 1;
+            }
+            out.push((
+                source[base + start..base + i].into(),
+                Span {
+                    start: base + start,
+                    end: base + i,
+                },
+            ));
+        } else {
+            i += 1;
+        }
+    }
 }
 
 fn simple_nested_modifier<'a>(
@@ -468,6 +734,38 @@ fn amp_suffixes(selector: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn extracts_custom_properties_and_short_annotations() {
+        let source = r#"/* @import-props "./theme.scss": --brand */
+/* @export-props: --runtime */
+:root { --brand: red; }
+@property --progress { syntax: "<number>"; inherits: false; initial-value: 0; }
+/* @suppress-unresolved-prop */
+.card { color: var(--missing, var(--brand)); }"#;
+        let facts = parse_stylesheet(source);
+        assert!(
+            facts
+                .custom_property_declarations
+                .iter()
+                .any(|d| d.name == "--brand")
+        );
+        let registration = facts
+            .custom_property_declarations
+            .iter()
+            .find(|d| d.name == "--progress" && d.registered)
+            .unwrap();
+        assert_eq!(registration.syntax.as_deref(), Some("<number>"));
+        assert_eq!(
+            facts
+                .custom_property_references
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["--missing", "--brand"]
+        );
+        assert_eq!(facts.property_annotations.imports[0].names[0].0, "--brand");
+        assert_eq!(facts.property_annotations.exports[0].0, "--runtime");
+    }
     #[test]
     fn functional_scope() {
         let f = parse_stylesheet(":where(.mine, :global(.external), :is(.other)) {}");

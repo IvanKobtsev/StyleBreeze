@@ -29,9 +29,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     args: ['--stdio'],
     options: { cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath },
   };
-  const stylesheetWatcher = vscode.workspace.createFileSystemWatcher(
-    '**/*.module.{css,scss}',
-  );
+  const stylesheetWatcher = vscode.workspace.createFileSystemWatcher('**/*.{css,scss}');
   const scriptWatcher = vscode.workspace.createFileSystemWatcher(
     '**/*.{js,jsx,ts,tsx}',
   );
@@ -41,6 +39,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     documentSelector: [
       { scheme: 'file', language: 'css', pattern: '**/*.module.css' },
       { scheme: 'file', language: 'scss', pattern: '**/*.module.scss' },
+      { scheme: 'file', language: 'css', pattern: '**/*.css' },
+      { scheme: 'file', language: 'scss', pattern: '**/*.scss' },
       { scheme: 'file', language: 'typescript' },
       { scheme: 'file', language: 'typescriptreact' },
       { scheme: 'file', language: 'javascript' },
@@ -55,6 +55,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         if (!isModuleStylesheet(document)) {
           return next(document, position, token);
         }
+        const propertyRange = document.getWordRangeAtPosition(position, /--[A-Za-z0-9_-]+/);
+        if (propertyRange) return next(document, position, token);
         const references = await client?.sendRequest<ProtocolLocation[]>(
           'textDocument/references',
           {

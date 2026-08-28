@@ -39,9 +39,36 @@
           "enum": ["off", "messages", "verbose"],
           "default": "off",
           "description": "Language-server protocol trace level."
+        },
+        "styleBreeze.customProperties.globalSelectors": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [":root"],
+          "description": "Selectors whose literal custom-property declarations are project-wide. Attribute-presence selectors also match value variants."
+        },
+        "styleBreeze.customProperties.presentation": {
+          "type": "object",
+          "default": {
+            "global": "semantic",
+            "local": "semantic",
+            "registered": "semantic",
+            "imported": "semantic",
+            "exported": "semantic",
+            "unresolved": "semantic"
+          },
+          "description": "Presentation mode per custom-property role: semantic, inlayHint, or off."
         }
       }
-    }
+    },
+    "semanticTokenTypes": [{ "id": "styleBreezeCustomProperty", "description": "StyleBreeze custom property" }],
+    "semanticTokenModifiers": [
+      { "id": "global", "description": "Global custom property" },
+      { "id": "local", "description": "Local custom property" },
+      { "id": "registered", "description": "Registered custom property" },
+      { "id": "imported", "description": "Imported custom property" },
+      { "id": "exported", "description": "Exported custom property" },
+      { "id": "unresolved", "description": "Unresolved custom property" }
+    ]
   },
   "scripts": {
     "compile": "esbuild src/extension.ts --bundle --platform=node --external:vscode --outfile=dist/extension.js",

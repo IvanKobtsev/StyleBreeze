@@ -94,6 +94,37 @@ struct ModuleImport {
     binding: String,
     module: PathBuf,
 }
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomPropertyOccurrence {
+    pub name: String,
+    pub span: Span,
+    pub declaration: bool,
+    pub roles: Vec<String>,
+}
+#[derive(Clone, Debug)]
+struct PropertyDeclaration {
+    name: String,
+    span: Span,
+    global: bool,
+    registered: bool,
+    syntax: Option<String>,
+    inherits: Option<bool>,
+    initial_value: Option<String>,
+    selector: Option<String>,
+}
+#[derive(Clone, Debug)]
+struct PropertyReference {
+    name: String,
+    span: Span,
+    line: usize,
+}
+#[derive(Clone, Debug)]
+struct PropertyImport {
+    source: PathBuf,
+    path_span: Span,
+    names: Vec<(String, Span)>,
+}
 #[derive(Clone, Debug)]
 struct FileRecord {
     source: String,
@@ -105,6 +136,11 @@ struct FileRecord {
     diagnostics: Vec<Diagnostic>,
     modifier_rules: Vec<ModifierRule>,
     selectors: Vec<SelectorRule>,
+    property_declarations: Vec<PropertyDeclaration>,
+    property_references: Vec<PropertyReference>,
+    property_imports: Vec<PropertyImport>,
+    property_exports: Vec<(String, Span)>,
+    suppressed_lines: Vec<usize>,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -123,6 +159,8 @@ pub struct Project {
     files: HashMap<PathBuf, FileRecord>,
     roots: Vec<PathBuf>,
     resolver: Box<dyn Resolver>,
+    global_selectors: Vec<String>,
+    property_presentation: HashMap<String, String>,
 }
 impl Default for Project {
     fn default() -> Self {
@@ -130,6 +168,18 @@ impl Default for Project {
             files: HashMap::new(),
             roots: Vec::new(),
             resolver: Box::new(FileSystemResolver::default()),
+            global_selectors: vec![":root".into()],
+            property_presentation: [
+                "global",
+                "local",
+                "registered",
+                "imported",
+                "exported",
+                "unresolved",
+            ]
+            .into_iter()
+            .map(|r| (r.into(), "semantic".into()))
+            .collect(),
         }
     }
 }
@@ -174,9 +224,86 @@ impl Project {
         let mut diagnostics = Vec::new();
         let mut modifier_rules = Vec::new();
         let mut selectors = Vec::new();
+        let mut property_declarations = Vec::new();
+        let mut property_references = Vec::new();
+        let mut property_imports = Vec::new();
+        let mut property_exports = Vec::new();
+        let mut suppressed_lines = Vec::new();
         if stylesheet(&path) {
             let facts = parse_stylesheet(&source);
             selectors = facts.selectors.clone();
+            property_declarations = facts
+                .custom_property_declarations
+                .iter()
+                .map(|d| PropertyDeclaration {
+                    name: d.name.clone(),
+                    span: Span {
+                        start: d.span.start,
+                        end: d.span.end,
+                    },
+                    global: d.selector.as_deref().is_some_and(selector_is_global),
+                    registered: d.registered,
+                    syntax: d.syntax.clone(),
+                    inherits: d.inherits,
+                    initial_value: d.initial_value.clone(),
+                    selector: d.selector.clone(),
+                })
+                .collect();
+            property_references = facts
+                .custom_property_references
+                .iter()
+                .map(|r| PropertyReference {
+                    name: r.name.clone(),
+                    span: Span {
+                        start: r.span.start,
+                        end: r.span.end,
+                    },
+                    line: r.line,
+                })
+                .collect();
+            property_exports = facts
+                .property_annotations
+                .exports
+                .iter()
+                .map(|(n, s)| {
+                    (
+                        n.clone(),
+                        Span {
+                            start: s.start,
+                            end: s.end,
+                        },
+                    )
+                })
+                .collect();
+            suppressed_lines = facts.property_annotations.suppress_next_lines.clone();
+            property_imports = facts
+                .property_annotations
+                .imports
+                .iter()
+                .map(|import| {
+                    let source_path = path.parent().unwrap_or(Path::new("")).join(&import.path);
+                    PropertyImport {
+                        source: canonical_or(source_path),
+                        path_span: Span {
+                            start: import.path_span.start,
+                            end: import.path_span.end,
+                        },
+                        names: import
+                            .names
+                            .iter()
+                            .map(|(n, s)| {
+                                (
+                                    n.clone(),
+                                    Span {
+                                        start: s.start,
+                                        end: s.end,
+                                    },
+                                )
+                            })
+                            .collect(),
+                    }
+                })
+                .collect();
             let independent: HashSet<_> = facts.independent_classes.iter().cloned().collect();
             let mut by_name: HashMap<String, Vec<Span>> = HashMap::new();
             for c in facts
@@ -235,6 +362,10 @@ impl Project {
                     message: d.message,
                     unnecessary: false,
                 });
+            }
+            if !module_stylesheet(&path) {
+                exports.clear();
+                modifier_rules.clear();
             }
         } else {
             let facts = parse_typescript(&path, &source);
@@ -310,6 +441,11 @@ impl Project {
                 diagnostics,
                 modifier_rules,
                 selectors,
+                property_declarations,
+                property_references,
+                property_imports,
+                property_exports,
+                suppressed_lines,
             },
         );
     }
@@ -321,6 +457,28 @@ impl Project {
             self.files.remove(&p);
         }
     }
+    pub fn set_global_selectors(&mut self, selectors: Vec<String>) {
+        self.global_selectors = if selectors.is_empty() {
+            vec![":root".into()]
+        } else {
+            selectors
+        };
+        for file in self.files.values_mut() {
+            for declaration in &mut file.property_declarations {
+                declaration.global = declaration
+                    .selector
+                    .as_deref()
+                    .is_some_and(|s| selector_matches_globals(s, &self.global_selectors));
+            }
+        }
+    }
+    pub fn set_property_presentation(&mut self, presentation: HashMap<String, String>) {
+        for (role, mode) in presentation {
+            if matches!(mode.as_str(), "semantic" | "inlayHint" | "off") {
+                self.property_presentation.insert(role, mode);
+            }
+        }
+    }
     pub fn remove_file(&mut self, path: &Path) {
         self.files.remove(&canonical_or(path.to_path_buf()));
     }
@@ -328,6 +486,76 @@ impl Project {
         self.definitions_at(path, offset).into_iter().next()
     }
     pub fn definitions_at(&self, path: &Path, offset: usize) -> Vec<Location> {
+        let p = canonical_or(path.to_path_buf());
+        if let Some((name, _)) = self.property_symbol_at(&p, offset) {
+            if let Some(f) = self.files.get(&p) {
+                for import in &f.property_imports {
+                    let selected = import
+                        .names
+                        .iter()
+                        .any(|(n, s)| n == &name && inside(*s, offset))
+                        || f.property_references
+                            .iter()
+                            .any(|r| r.name == name && inside(r.span, offset));
+                    if selected && let Some(source) = self.files.get(&import.source) {
+                        let found: Vec<_> = source
+                            .property_declarations
+                            .iter()
+                            .filter(|d| d.name == name)
+                            .map(|d| Location {
+                                path: import.source.clone(),
+                                span: d.span,
+                            })
+                            .chain(
+                                source
+                                    .property_exports
+                                    .iter()
+                                    .filter(|(n, _)| n == &name)
+                                    .map(|(_, s)| Location {
+                                        path: import.source.clone(),
+                                        span: *s,
+                                    }),
+                            )
+                            .collect();
+                        if !found.is_empty() {
+                            return found;
+                        }
+                    }
+                }
+            }
+            let mut found = Vec::new();
+            if let Some(f) = self.files.get(&p) {
+                found.extend(
+                    f.property_declarations
+                        .iter()
+                        .filter(|d| d.name == name)
+                        .map(|d| Location {
+                            path: p.clone(),
+                            span: d.span,
+                        }),
+                );
+                found.extend(f.property_exports.iter().filter(|(n, _)| n == &name).map(
+                    |(_, s)| Location {
+                        path: p.clone(),
+                        span: *s,
+                    },
+                ));
+            }
+            if found.is_empty() {
+                for (q, f) in &self.files {
+                    found.extend(
+                        f.property_declarations
+                            .iter()
+                            .filter(|d| d.name == name && (d.global || d.registered))
+                            .map(|d| Location {
+                                path: q.clone(),
+                                span: d.span,
+                            }),
+                    );
+                }
+            }
+            return found;
+        }
         let Some((module, name)) = self.symbol_at(path, offset) else {
             return vec![];
         };
@@ -411,6 +639,68 @@ impl Project {
         offset: usize,
         include_declaration: bool,
     ) -> Vec<Location> {
+        let p = canonical_or(path.to_path_buf());
+        if let Some((name, _)) = self.property_symbol_at(&p, offset) {
+            let roles = self.property_roles(&p, &name);
+            let project_wide = roles.iter().any(|r| r == "global" || r == "registered");
+            let origin = self.property_origin(&p, &name);
+            let mut out = Vec::new();
+            for (q, f) in &self.files {
+                let participates = project_wide
+                    || origin.as_ref().is_some_and(|source| {
+                        q == source
+                            || f.property_imports.iter().any(|i| {
+                                &i.source == source && i.names.iter().any(|(n, _)| n == &name)
+                            })
+                    });
+                if !participates {
+                    continue;
+                }
+                out.extend(
+                    f.property_references
+                        .iter()
+                        .filter(|r| r.name == name)
+                        .map(|r| Location {
+                            path: q.clone(),
+                            span: r.span,
+                        }),
+                );
+                for i in &f.property_imports {
+                    out.extend(
+                        i.names
+                            .iter()
+                            .filter(|(n, _)| n == &name)
+                            .map(|(_, s)| Location {
+                                path: q.clone(),
+                                span: *s,
+                            }),
+                    );
+                }
+                out.extend(
+                    f.property_exports
+                        .iter()
+                        .filter(|(n, _)| n == &name)
+                        .map(|(_, s)| Location {
+                            path: q.clone(),
+                            span: *s,
+                        }),
+                );
+                if include_declaration {
+                    out.extend(
+                        f.property_declarations
+                            .iter()
+                            .filter(|d| d.name == name)
+                            .map(|d| Location {
+                                path: q.clone(),
+                                span: d.span,
+                            }),
+                    );
+                }
+            }
+            out.sort_by(|a, b| a.path.cmp(&b.path).then(a.span.start.cmp(&b.span.start)));
+            out.dedup();
+            return out;
+        }
         let Some((module, name)) = self.symbol_at(path, offset) else {
             return vec![];
         };
@@ -456,6 +746,10 @@ impl Project {
         out
     }
     pub fn prepare_rename(&self, path: &Path, offset: usize) -> Result<Span, RenameError> {
+        let p = canonical_or(path.to_path_buf());
+        if let Some((_, span)) = self.property_symbol_at(&p, offset) {
+            return Ok(span);
+        }
         let (_, name) = self.symbol_at(path, offset).ok_or(RenameError::NoSymbol)?;
         self.span_at(path, offset, &name)
             .ok_or(RenameError::NoSymbol)
@@ -466,6 +760,27 @@ impl Project {
         offset: usize,
         new_name: &str,
     ) -> Result<Vec<TextEdit>, RenameError> {
+        let p = canonical_or(path.to_path_buf());
+        if let Some((name, _)) = self.property_symbol_at(&p, offset) {
+            if !valid_custom_property_name(new_name) {
+                return Err(RenameError::InvalidName);
+            }
+            if self.files.values().any(|f| {
+                f.property_declarations
+                    .iter()
+                    .any(|d| d.name == new_name && d.name != name)
+            }) {
+                return Err(RenameError::Collision(new_name.into()));
+            }
+            return Ok(self
+                .references_at(&p, offset, true)
+                .into_iter()
+                .map(|location| TextEdit {
+                    location,
+                    new_text: new_name.into(),
+                })
+                .collect());
+        }
         if !valid_name(new_name) {
             return Err(RenameError::InvalidName);
         }
@@ -500,6 +815,72 @@ impl Project {
             .map(|f| f.diagnostics.clone())
             .unwrap_or_default();
         if let Some(f) = self.files.get(&p) {
+            for reference in &f.property_references {
+                if !f.suppressed_lines.contains(&reference.line)
+                    && !self.property_resolved(&p, &reference.name)
+                {
+                    out.push(Diagnostic { location: Location { path: p.clone(), span: reference.span }, severity: Severity::Warning,
+                        code: "unresolved-custom-property", message: format!("Custom property '{}' is not declared in this module, globally, or as an explicit dependency", reference.name), unnecessary: false });
+                }
+            }
+            let mut seen = HashSet::new();
+            for import in &f.property_imports {
+                if !self.files.contains_key(&import.source) {
+                    out.push(Diagnostic {
+                        location: Location {
+                            path: p.clone(),
+                            span: import.path_span,
+                        },
+                        severity: Severity::Warning,
+                        code: "missing-property-import-source",
+                        message: "Imported property stylesheet cannot be resolved".into(),
+                        unnecessary: false,
+                    });
+                }
+                for (name, span) in &import.names {
+                    if !seen.insert((import.source.clone(), name.clone())) {
+                        out.push(Diagnostic {
+                            location: Location {
+                                path: p.clone(),
+                                span: *span,
+                            },
+                            severity: Severity::Warning,
+                            code: "duplicate-property-import",
+                            message: format!("Property '{}' is imported more than once", name),
+                            unnecessary: false,
+                        });
+                    } else if let Some(source) = self.files.get(&import.source) {
+                        if !source.property_declarations.iter().any(|d| d.name == *name)
+                            && !source.property_exports.iter().any(|(n, _)| n == name)
+                        {
+                            out.push(Diagnostic {
+                                location: Location {
+                                    path: p.clone(),
+                                    span: *span,
+                                },
+                                severity: Severity::Warning,
+                                code: "missing-imported-property",
+                                message: format!(
+                                    "Property '{}' is not declared or exported by this stylesheet",
+                                    name
+                                ),
+                                unnecessary: false,
+                            });
+                        } else if !f.property_references.iter().any(|r| r.name == *name) {
+                            out.push(Diagnostic {
+                                location: Location {
+                                    path: p.clone(),
+                                    span: *span,
+                                },
+                                severity: Severity::Hint,
+                                code: "unused-property-import",
+                                message: format!("Imported property '{}' is unused", name),
+                                unnecessary: true,
+                            });
+                        }
+                    }
+                }
+            }
             for r in &f.references {
                 if let Some(module) = self.files.get(&r.module)
                     && !module.exports.iter().any(|e| e.name == r.name)
@@ -659,6 +1040,36 @@ impl Project {
         let Some(file) = self.files.get(&path) else {
             return Vec::new();
         };
+        if let Some(import) = file.property_imports.iter().find(|i| {
+            offset >= i.path_span.end
+                && file.source[i.path_span.end..]
+                    .find("*/")
+                    .is_some_and(|relative_end| offset <= i.path_span.end + relative_end)
+        }) {
+            let prefix = property_prefix(&file.source, offset);
+            let mut names: Vec<String> = self
+                .files
+                .get(&import.source)
+                .map(|f| {
+                    f.property_declarations
+                        .iter()
+                        .map(|d| d.name.clone())
+                        .chain(f.property_exports.iter().map(|(n, _)| n.clone()))
+                        .filter(|n| n.starts_with(prefix))
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            names.dedup();
+            return names;
+        }
+        if let Some(prefix) = var_context(&file.source, offset) {
+            let mut names = self.available_properties(&path);
+            names.retain(|name| name.starts_with(prefix));
+            names.sort();
+            names.dedup();
+            return names;
+        }
         let Some((binding, prefix)) = member_context(&file.source, offset) else {
             return Vec::new();
         };
@@ -733,6 +1144,33 @@ impl Project {
     }
     pub fn hover_at(&self, path: &Path, offset: usize) -> Option<HoverInfo> {
         let source_path = canonical_or(path.to_path_buf());
+        if let Some((name, span)) = self.property_symbol_at(&source_path, offset) {
+            let roles = self.property_roles(&source_path, &name);
+            let registration = self
+                .files
+                .values()
+                .flat_map(|f| &f.property_declarations)
+                .find(|d| d.name == name && d.registered);
+            let mut markdown = format!(
+                "**Custom property** `{name}`\n\nRoles: {}",
+                roles.join(", ")
+            );
+            if let Some(d) = registration {
+                markdown.push_str(&format!(
+                    "\n\nSyntax: `{}`  \nInherits: `{}`  \nInitial value: `{}`",
+                    d.syntax.as_deref().unwrap_or("unknown"),
+                    d.inherits
+                        .map(|v| v.to_string())
+                        .as_deref()
+                        .unwrap_or("unknown"),
+                    d.initial_value.as_deref().unwrap_or("none")
+                ));
+            }
+            return Some(HoverInfo {
+                range: span,
+                markdown,
+            });
+        }
         let (module, name) = self.symbol_at(&source_path, offset)?;
         let module_file = self.files.get(&module)?;
         let mut rules: Vec<_> = module_file
@@ -841,6 +1279,202 @@ impl Project {
             .get(&canonical_or(path.to_path_buf()))
             .and_then(|f| f.version)
     }
+    pub fn custom_property_occurrences(&self, path: &Path) -> Vec<CustomPropertyOccurrence> {
+        let p = canonical_or(path.to_path_buf());
+        let Some(f) = self.files.get(&p) else {
+            return vec![];
+        };
+        let mut out = Vec::new();
+        for d in &f.property_declarations {
+            out.push(CustomPropertyOccurrence {
+                name: d.name.clone(),
+                span: d.span,
+                declaration: true,
+                roles: self.property_roles(&p, &d.name),
+            });
+        }
+        for (name, span) in &f.property_exports {
+            out.push(CustomPropertyOccurrence {
+                name: name.clone(),
+                span: *span,
+                declaration: true,
+                roles: vec!["exported".into()],
+            });
+        }
+        for import in &f.property_imports {
+            for (name, span) in &import.names {
+                out.push(CustomPropertyOccurrence {
+                    name: name.clone(),
+                    span: *span,
+                    declaration: true,
+                    roles: vec!["imported".into()],
+                });
+            }
+        }
+        for r in &f.property_references {
+            out.push(CustomPropertyOccurrence {
+                name: r.name.clone(),
+                span: r.span,
+                declaration: false,
+                roles: self.property_roles(&p, &r.name),
+            });
+        }
+        out.sort_by_key(|o| o.span.start);
+        out
+    }
+    pub fn custom_property_occurrences_for(
+        &self,
+        path: &Path,
+        mode: &str,
+    ) -> Vec<CustomPropertyOccurrence> {
+        self.custom_property_occurrences(path)
+            .into_iter()
+            .filter(|o| {
+                o.roles
+                    .iter()
+                    .any(|r| self.property_presentation.get(r).is_some_and(|m| m == mode))
+            })
+            .collect()
+    }
+    pub fn property_declaration_sources(&self, name: &str) -> Vec<PathBuf> {
+        let mut out: Vec<_> = self
+            .files
+            .iter()
+            .filter(|(_, f)| {
+                f.property_declarations.iter().any(|d| d.name == name)
+                    || f.property_exports.iter().any(|(n, _)| n == name)
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+    pub fn known_property_names(&self) -> Vec<String> {
+        let mut out: Vec<_> = self
+            .files
+            .values()
+            .flat_map(|f| {
+                f.property_declarations
+                    .iter()
+                    .map(|d| d.name.clone())
+                    .chain(f.property_exports.iter().map(|(n, _)| n.clone()))
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
+    fn property_symbol_at(&self, path: &Path, offset: usize) -> Option<(String, Span)> {
+        let f = self.files.get(path)?;
+        for d in &f.property_declarations {
+            if inside(d.span, offset) {
+                return Some((d.name.clone(), d.span));
+            }
+        }
+        for r in &f.property_references {
+            if inside(r.span, offset) {
+                return Some((r.name.clone(), r.span));
+            }
+        }
+        for (n, s) in &f.property_exports {
+            if inside(*s, offset) {
+                return Some((n.clone(), *s));
+            }
+        }
+        for i in &f.property_imports {
+            for (n, s) in &i.names {
+                if inside(*s, offset) {
+                    return Some((n.clone(), *s));
+                }
+            }
+        }
+        None
+    }
+    fn property_resolved(&self, path: &Path, name: &str) -> bool {
+        !self
+            .property_roles(path, name)
+            .contains(&"unresolved".into())
+    }
+    fn property_origin(&self, path: &Path, name: &str) -> Option<PathBuf> {
+        let f = self.files.get(path)?;
+        if f.property_declarations.iter().any(|d| d.name == name)
+            || f.property_exports.iter().any(|(n, _)| n == name)
+        {
+            return Some(path.to_path_buf());
+        }
+        f.property_imports
+            .iter()
+            .find(|i| {
+                i.names.iter().any(|(n, _)| n == name)
+                    && self.files.get(&i.source).is_some_and(|source| {
+                        source.property_declarations.iter().any(|d| d.name == name)
+                            || source.property_exports.iter().any(|(n, _)| n == name)
+                    })
+            })
+            .map(|i| i.source.clone())
+    }
+    fn property_roles(&self, path: &Path, name: &str) -> Vec<String> {
+        let mut roles = Vec::new();
+        let Some(f) = self.files.get(path) else {
+            return vec!["unresolved".into()];
+        };
+        if f.property_declarations
+            .iter()
+            .any(|d| d.name == name && !d.registered)
+        {
+            roles.push("local".into());
+        }
+        if self.files.values().any(|x| {
+            x.property_declarations
+                .iter()
+                .any(|d| d.name == name && d.global)
+        }) {
+            roles.push("global".into());
+        }
+        if self.files.values().any(|x| {
+            x.property_declarations
+                .iter()
+                .any(|d| d.name == name && d.registered)
+        }) {
+            roles.push("registered".into());
+        }
+        if f.property_imports.iter().any(|i| {
+            i.names.iter().any(|(n, _)| n == name)
+                && self.files.get(&i.source).is_some_and(|source| {
+                    source.property_declarations.iter().any(|d| d.name == name)
+                        || source.property_exports.iter().any(|(n, _)| n == name)
+                })
+        }) {
+            roles.push("imported".into());
+        }
+        if f.property_exports.iter().any(|(n, _)| n == name) {
+            roles.push("exported".into());
+        }
+        if roles.is_empty() {
+            roles.push("unresolved".into());
+        }
+        roles
+    }
+    fn available_properties(&self, path: &Path) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(f) = self.files.get(path) {
+            out.extend(f.property_declarations.iter().map(|d| d.name.clone()));
+            out.extend(f.property_exports.iter().map(|(n, _)| n.clone()));
+            for i in &f.property_imports {
+                out.extend(i.names.iter().map(|(n, _)| n.clone()));
+            }
+        }
+        for f in self.files.values() {
+            out.extend(
+                f.property_declarations
+                    .iter()
+                    .filter(|d| d.global || d.registered)
+                    .map(|d| d.name.clone()),
+            );
+        }
+        out
+    }
     fn reference_satisfies(
         &self,
         file: &FileRecord,
@@ -934,6 +1568,68 @@ fn valid_name(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
         && !s.as_bytes()[0].is_ascii_digit()
 }
+fn valid_custom_property_name(s: &str) -> bool {
+    s.starts_with("--") && s.len() > 2 && s[2..].bytes().all(ident_member_or_dash)
+}
+fn ident_member_or_dash(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-') || b >= 0x80
+}
+fn selector_is_global(selector: &str) -> bool {
+    selector.split(',').any(|branch| branch.trim() == ":root")
+}
+fn selector_matches_globals(selector: &str, patterns: &[String]) -> bool {
+    selector.split(',').any(|branch| {
+        let branch = branch.trim();
+        patterns.iter().any(|pattern| {
+            let pattern = pattern.trim();
+            if pattern.starts_with('[') && pattern.ends_with(']') && !pattern.contains('=') {
+                let attr = &pattern[1..pattern.len() - 1];
+                branch.contains(&format!("[{attr}]"))
+                    || branch.contains(&format!("[{attr}="))
+                    || branch.contains(&format!("[{attr}~="))
+                    || branch.contains(&format!("[{attr}|="))
+                    || branch.contains(&format!("[{attr}^="))
+                    || branch.contains(&format!("[{attr}$="))
+                    || branch.contains(&format!("[{attr}*="))
+            } else {
+                branch == pattern
+            }
+        })
+    })
+}
+fn var_context(source: &str, offset: usize) -> Option<&str> {
+    if offset > source.len() {
+        return None;
+    }
+    let head = &source[..offset];
+    let open = head.rfind("var(")?;
+    if head[open + 4..].contains(')') {
+        return None;
+    }
+    let value = head[open + 4..].trim_start();
+    if value.contains(',') {
+        return None;
+    }
+    if value.is_empty() {
+        return Some("");
+    }
+    if value.starts_with("--") && value.bytes().all(ident_member_or_dash) {
+        Some(value)
+    } else {
+        None
+    }
+}
+fn property_prefix(source: &str, offset: usize) -> &str {
+    if offset > source.len() {
+        return "";
+    }
+    let bytes = source.as_bytes();
+    let mut start = offset;
+    while start > 0 && ident_member_or_dash(bytes[start - 1]) {
+        start -= 1;
+    }
+    &source[start..offset]
+}
 fn valid_dot_name(s: &str) -> bool {
     !s.is_empty()
         && !s.as_bytes()[0].is_ascii_digit()
@@ -972,6 +1668,10 @@ fn canonical_or(p: PathBuf) -> PathBuf {
 }
 fn stylesheet(p: &Path) -> bool {
     let s = p.to_string_lossy();
+    s.ends_with(".css") || s.ends_with(".scss")
+}
+fn module_stylesheet(p: &Path) -> bool {
+    let s = p.to_string_lossy();
     s.ends_with(".module.css") || s.ends_with(".module.scss")
 }
 fn relevant(p: &Path) -> bool {
@@ -986,6 +1686,80 @@ fn relevant(p: &Path) -> bool {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    #[test]
+    fn custom_property_ownership_imports_and_suppression() {
+        let d = tempdir().unwrap();
+        let theme = d.path().join("theme.scss");
+        let card = d.path().join("card.scss");
+        fs::write(
+            &theme,
+            ":root { --global: red; } .theme { --local: blue; } /* @export-props: --runtime */",
+        )
+        .unwrap();
+        fs::write(&card,"/* @import-props \"./theme.scss\": --local, --runtime, --unused */\n.card { --owned: 1; color: var(--owned); background: var(--global); border: var(--local); x: var(--runtime); y: var(--missing, red); }\n/* @suppress-unresolved-prop */\nz: var(--suppressed);").unwrap();
+        let mut p = Project::new(vec![d.path().to_path_buf()]);
+        p.index_workspace();
+        let diagnostics = p.diagnostics_for(&card);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code == "unresolved-custom-property" && d.message.contains("--missing"))
+        );
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("--suppressed"))
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code == "missing-imported-property" && d.message.contains("--unused"))
+        );
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.code == "unresolved-custom-property" && d.message.contains("--local"))
+        );
+    }
+    #[test]
+    fn local_property_rename_does_not_touch_unrelated_modules() {
+        let d = tempdir().unwrap();
+        let one = d.path().join("one.scss");
+        let two = d.path().join("two.scss");
+        fs::write(&one, ".one { --shared: red; color: var(--shared); }").unwrap();
+        fs::write(&two, ".two { --shared: blue; color: var(--shared); }").unwrap();
+        let mut p = Project::new(vec![d.path().to_path_buf()]);
+        p.index_workspace();
+        let offset = p.source(&one).unwrap().find("--shared").unwrap();
+        let edits = p.rename(&one, offset, "--renamed").unwrap();
+        assert_eq!(edits.len(), 2);
+        assert!(
+            edits
+                .iter()
+                .all(|edit| edit.location.path == canonical_or(one.clone()))
+        );
+    }
+    #[test]
+    fn configured_attribute_presence_selector_is_global() {
+        let d = tempdir().unwrap();
+        let theme = d.path().join("theme.css");
+        let use_file = d.path().join("use.css");
+        fs::write(&theme, "[data-theme=\"dark\"] { --surface: black; }").unwrap();
+        fs::write(&use_file, ".card { color: var(--surface); }").unwrap();
+        let mut p = Project::new(vec![d.path().to_path_buf()]);
+        p.index_workspace();
+        assert!(
+            p.diagnostics_for(&use_file)
+                .iter()
+                .any(|d| d.code == "unresolved-custom-property")
+        );
+        p.set_global_selectors(vec!["[data-theme]".into()]);
+        assert!(
+            !p.diagnostics_for(&use_file)
+                .iter()
+                .any(|d| d.code == "unresolved-custom-property")
+        );
+    }
     #[test]
     fn navigation_diagnostics_and_rename() {
         let d = tempdir().unwrap();

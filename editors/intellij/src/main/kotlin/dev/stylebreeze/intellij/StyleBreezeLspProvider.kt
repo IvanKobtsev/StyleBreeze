@@ -22,7 +22,7 @@ class StyleBreezeLspProvider : LspIntegrationProvider {
     companion object {
         internal fun supports(file: VirtualFile): Boolean {
             val name = file.name.lowercase()
-            return name.endsWith(".module.css") || name.endsWith(".module.scss") ||
+            return name.endsWith(".css") || name.endsWith(".scss") ||
                 file.extension?.lowercase() in setOf("js", "jsx", "ts", "tsx")
         }
     }

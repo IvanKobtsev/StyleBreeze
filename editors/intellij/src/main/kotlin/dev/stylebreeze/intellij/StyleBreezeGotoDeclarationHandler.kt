@@ -58,7 +58,7 @@ class StyleBreezeGotoDeclarationHandler : GotoDeclarationHandler {
             .filter { it.descriptor.isSupportedFile(file) }
 
         for (client in clients) {
-            if (isStylesheet(file)) {
+            if (isStylesheet(file) && !isCustomPropertyAt(document.charsSequence, offset)) {
                 val declaration = request("definition") {
                     client.sendRequestSync(2_000) { server ->
                         server.textDocumentService.definition(
@@ -144,6 +144,12 @@ class StyleBreezeGotoDeclarationHandler : GotoDeclarationHandler {
         private fun isStylesheet(file: VirtualFile): Boolean {
             val name = file.name.lowercase()
             return name.endsWith(".module.css") || name.endsWith(".module.scss")
+        }
+
+        private fun isCustomPropertyAt(text: CharSequence, offset: Int): Boolean {
+            var start = offset.coerceAtMost(text.length)
+            while (start > 0 && (text[start - 1].isLetterOrDigit() || text[start - 1] == '_' || text[start - 1] == '-')) start--
+            return start + 1 < text.length && text[start] == '-' && text[start + 1] == '-'
         }
     }
 }

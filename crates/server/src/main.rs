@@ -21,7 +21,7 @@ fn main() -> Result<()> {
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         references_provider: Some(OneOf::Left(true)),
         completion_provider: Some(CompletionOptions {
-            trigger_characters: Some(vec![".".into()]),
+            trigger_characters: Some(vec![".".into(), "-".into()]),
             ..Default::default()
         }),
         rename_provider: Some(OneOf::Right(RenameOptions {
@@ -34,6 +34,30 @@ fn main() -> Result<()> {
             workspace_diagnostics: true,
             work_done_progress_options: Default::default(),
         })),
+        semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
+            SemanticTokensOptions {
+                legend: SemanticTokensLegend {
+                    token_types: vec![SemanticTokenType::new("styleBreezeCustomProperty")],
+                    token_modifiers: vec![
+                        "global",
+                        "local",
+                        "registered",
+                        "imported",
+                        "exported",
+                        "unresolved",
+                        "declaration",
+                    ]
+                    .into_iter()
+                    .map(SemanticTokenModifier::new)
+                    .collect(),
+                },
+                range: Some(false),
+                full: Some(SemanticTokensFullOptions::Bool(true)),
+                work_done_progress_options: Default::default(),
+            },
+        )),
+        inlay_hint_provider: Some(OneOf::Left(true)),
+        code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         ..Default::default()
     };
     let init = connection.initialize(serde_json::to_value(capabilities)?)?;
@@ -110,6 +134,34 @@ fn handle_notification(c: &Connection, p: &mut Project, n: Notification) -> Resu
                     publish_all(c, p)?;
                 }
             }
+        }
+        notif::DidChangeConfiguration::METHOD => {
+            let q: DidChangeConfigurationParams = serde_json::from_value(n.params)?;
+            let settings = q.settings.get("styleBreeze").unwrap_or(&q.settings);
+            let custom = settings
+                .get("customProperties")
+                .unwrap_or(&serde_json::Value::Null);
+            let selectors = custom
+                .get("globalSelectors")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_else(|| vec![":root".into()]);
+            let presentation = custom
+                .get("presentation")
+                .and_then(|v| v.as_object())
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
+                        .collect()
+                })
+                .unwrap_or_default();
+            p.set_global_selectors(selectors);
+            p.set_property_presentation(presentation);
+            publish_all(c, p)?;
         }
         _ => {}
     }
@@ -320,6 +372,113 @@ fn handle_request(c: &Connection, p: &Project, r: Request) -> Result<()> {
                 },
             ))?)
         }
+        req::SemanticTokensFullRequest::METHOD => {
+            let q: SemanticTokensParams = serde_json::from_value(r.params)?;
+            let path = q
+                .text_document
+                .uri
+                .to_file_path()
+                .map_err(|_| anyhow::anyhow!("invalid file URI"))?;
+            let source = p.source(&path).unwrap_or("");
+            let modifiers = [
+                "global",
+                "local",
+                "registered",
+                "imported",
+                "exported",
+                "unresolved",
+                "declaration",
+            ];
+            let mut absolute = Vec::new();
+            for item in p.custom_property_occurrences_for(&path, "semantic") {
+                let pos = stylebreeze_protocol::offset_to_position(source, item.span.start);
+                let end = stylebreeze_protocol::offset_to_position(source, item.span.end);
+                let mut bits = 0;
+                for role in &item.roles {
+                    if let Some(i) = modifiers.iter().position(|m| m == role) {
+                        bits |= 1 << i;
+                    }
+                }
+                if item.declaration {
+                    bits |= 1 << 6;
+                }
+                absolute.push((pos.line, pos.character, end.character - pos.character, bits));
+            }
+            absolute.sort();
+            let mut last_line = 0;
+            let mut last_char = 0;
+            let data = absolute
+                .into_iter()
+                .map(|(line, ch, len, bits)| {
+                    let dl = line - last_line;
+                    let ds = if dl == 0 { ch - last_char } else { ch };
+                    last_line = line;
+                    last_char = ch;
+                    SemanticToken {
+                        delta_line: dl,
+                        delta_start: ds,
+                        length: len,
+                        token_type: 0,
+                        token_modifiers_bitset: bits,
+                    }
+                })
+                .collect();
+            Ok(serde_json::to_value(SemanticTokensResult::Tokens(
+                SemanticTokens {
+                    result_id: None,
+                    data,
+                },
+            ))?)
+        }
+        req::InlayHintRequest::METHOD => {
+            let q: InlayHintParams = serde_json::from_value(r.params)?;
+            let path = q
+                .text_document
+                .uri
+                .to_file_path()
+                .map_err(|_| anyhow::anyhow!("invalid file URI"))?;
+            let source = p.source(&path).unwrap_or("");
+            let hints: Vec<_> = p
+                .custom_property_occurrences_for(&path, "inlayHint")
+                .into_iter()
+                .filter(|o| o.declaration)
+                .map(|o| InlayHint {
+                    position: stylebreeze_protocol::offset_to_position(source, o.span.end),
+                    label: InlayHintLabel::String(format!(" {}", o.roles.join(" + "))),
+                    kind: Some(InlayHintKind::TYPE),
+                    text_edits: None,
+                    tooltip: None,
+                    padding_left: Some(true),
+                    padding_right: None,
+                    data: None,
+                })
+                .collect();
+            Ok(serde_json::to_value(hints)?)
+        }
+        req::CodeActionRequest::METHOD => {
+            let q: CodeActionParams = serde_json::from_value(r.params)?;
+            let path = q
+                .text_document
+                .uri
+                .to_file_path()
+                .map_err(|_| anyhow::anyhow!("invalid file URI"))?;
+            let source = p.source(&path).unwrap_or("");
+            let mut actions = Vec::new();
+            let context_diagnostics = q.context.diagnostics;
+            for diagnostic in context_diagnostics.iter().filter(|d|matches!(&d.code,Some(NumberOrString::String(code)) if code=="unresolved-custom-property")).cloned() {
+                let start=stylebreeze_protocol::position_to_offset(source,diagnostic.range.start).unwrap_or(0);let end=stylebreeze_protocol::position_to_offset(source,diagnostic.range.end).unwrap_or(start);let name=&source[start..end];let uri=q.text_document.uri.clone();
+                let line_start=Position::new(diagnostic.range.start.line,0);
+                for(title,range,new_text,preferred)in[
+                    ("Create local declaration",Range::new(line_start,line_start),format!("  {name}: initial;\n"),true),
+                    ("Mark as exported",Range::new(Position::new(0,0),Position::new(0,0)),format!("/* @export-props: {name} */\n"),false),
+                    ("Suppress unresolved property",Range::new(line_start,line_start),"/* @suppress-unresolved-prop */\n".into(),false),
+                ]{let edit=WorkspaceEdit{changes:Some(HashMap::from([(uri.clone(),vec![lsp_types::TextEdit{range,new_text}])])),document_changes:None,change_annotations:None};actions.push(CodeActionOrCommand::CodeAction(CodeAction{title:title.into(),kind:Some(CodeActionKind::QUICKFIX),diagnostics:Some(vec![diagnostic.clone()]),edit:Some(edit),is_preferred:Some(preferred),..Default::default()}));}
+                for candidate in p.property_declaration_sources(name).into_iter().filter(|candidate|candidate!=&path){if let Some(parent)=path.parent() && let Ok(relative)=candidate.strip_prefix(parent){let specifier=format!("./{}",relative.to_string_lossy().replace('\\',"/"));let new_text=format!("/* @import-props \"{specifier}\": {name} */\n");let edit=WorkspaceEdit{changes:Some(HashMap::from([(uri.clone(),vec![lsp_types::TextEdit{range:Range::new(Position::new(0,0),Position::new(0,0)),new_text}])])),document_changes:None,change_annotations:None};actions.push(CodeActionOrCommand::CodeAction(CodeAction{title:format!("Import from {specifier}"),kind:Some(CodeActionKind::QUICKFIX),diagnostics:Some(vec![diagnostic.clone()]),edit:Some(edit),..Default::default()}));}}
+                if let Some(similar)=p.known_property_names().into_iter().filter(|candidate|candidate!=name).min_by_key(|candidate|edit_distance(name,candidate)).filter(|candidate|edit_distance(name,candidate)<=3){let edit=WorkspaceEdit{changes:Some(HashMap::from([(uri.clone(),vec![lsp_types::TextEdit{range:diagnostic.range,new_text:similar.clone()}])])),document_changes:None,change_annotations:None};actions.push(CodeActionOrCommand::CodeAction(CodeAction{title:format!("Replace with {similar}"),kind:Some(CodeActionKind::QUICKFIX),diagnostics:Some(vec![diagnostic.clone()]),edit:Some(edit),..Default::default()}));}
+            }
+            for diagnostic in context_diagnostics.iter().filter(|d|matches!(&d.code,Some(NumberOrString::String(code)) if matches!(code.as_str(),"missing-imported-property"|"duplicate-property-import"|"unused-property-import"))){let range=import_removal_range(source,diagnostic.range);let edit=WorkspaceEdit{changes:Some(HashMap::from([(q.text_document.uri.clone(),vec![lsp_types::TextEdit{range,new_text:String::new()}])])),document_changes:None,change_annotations:None};actions.push(CodeActionOrCommand::CodeAction(CodeAction{title:"Remove property from import".into(),kind:Some(CodeActionKind::QUICKFIX),diagnostics:Some(vec![diagnostic.clone()]),edit:Some(edit),is_preferred:Some(true),..Default::default()}));}
+            Ok(serde_json::to_value(actions)?)
+        }
         _ => Ok(serde_json::Value::Null),
     };
     match result {
@@ -331,6 +490,45 @@ fn handle_request(c: &Connection, p: &Project, r: Request) -> Result<()> {
         )))?,
     }
     Ok(())
+}
+fn edit_distance(a: &str, b: &str) -> usize {
+    let mut previous: Vec<_> = (0..=b.len()).collect();
+    for (i, ac) in a.bytes().enumerate() {
+        let mut current = vec![i + 1];
+        for (j, bc) in b.bytes().enumerate() {
+            current.push(
+                (previous[j + 1] + 1)
+                    .min(current[j] + 1)
+                    .min(previous[j] + usize::from(ac != bc)),
+            );
+        }
+        previous = current;
+    }
+    previous[b.len()]
+}
+fn import_removal_range(source: &str, range: Range) -> Range {
+    let mut start = stylebreeze_protocol::position_to_offset(source, range.start).unwrap_or(0);
+    let mut end = stylebreeze_protocol::position_to_offset(source, range.end).unwrap_or(start);
+    let bytes = source.as_bytes();
+    let mut cursor = end;
+    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    if cursor < bytes.len() && bytes[cursor] == b',' {
+        end = cursor + 1;
+    } else {
+        cursor = start;
+        while cursor > 0 && bytes[cursor - 1].is_ascii_whitespace() {
+            cursor -= 1;
+        }
+        if cursor > 0 && bytes[cursor - 1] == b',' {
+            start = cursor - 1;
+        }
+    }
+    Range::new(
+        stylebreeze_protocol::offset_to_position(source, start),
+        stylebreeze_protocol::offset_to_position(source, end),
+    )
 }
 fn publish(c: &Connection, p: &Project, path: &Path) -> Result<()> {
     let Some(source) = p.source(path) else {
