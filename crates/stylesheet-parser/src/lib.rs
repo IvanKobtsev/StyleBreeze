@@ -65,6 +65,51 @@ pub struct PropertyAnnotations {
     pub suppress_next_lines: Vec<usize>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SassSymbolKind {
+    Variable,
+    Mixin,
+    Function,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SassDeclaration {
+    pub name: String,
+    pub span: Span,
+    pub kind: SassSymbolKind,
+    pub private: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SassReference {
+    pub name: String,
+    pub span: Span,
+    pub kind: SassSymbolKind,
+    pub namespace: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SassDirectiveKind {
+    Use,
+    Forward,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SassDirective {
+    pub kind: SassDirectiveKind,
+    pub path: String,
+    pub path_span: Span,
+    pub statement_span: Span,
+    pub namespace: Option<String>,
+    pub star: bool,
+    pub prefix: Option<String>,
+    pub show: Vec<String>,
+    pub hide: Vec<String>,
+    pub member_spans: Vec<(String, Span)>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ModifierRule {
     pub modifier: String,
@@ -84,6 +129,9 @@ pub struct StylesheetFacts {
     pub custom_property_declarations: Vec<CustomPropertyDeclaration>,
     pub custom_property_references: Vec<CustomPropertyReference>,
     pub property_annotations: PropertyAnnotations,
+    pub sass_declarations: Vec<SassDeclaration>,
+    pub sass_references: Vec<SassReference>,
+    pub sass_directives: Vec<SassDirective>,
 }
 
 struct BlockContext {
@@ -392,7 +440,414 @@ pub fn parse_stylesheet(source: &str) -> StylesheetFacts {
     }
     facts.selectors = selector_preview::collect_selector_rules(source);
     collect_custom_property_facts(source, &mut facts);
+    collect_sass_facts(source, &mut facts);
     facts
+}
+
+fn collect_sass_facts(source: &str, facts: &mut StylesheetFacts) {
+    let bytes = source.as_bytes();
+    let mut masked = bytes.to_vec();
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'/' && matches!(bytes[i + 1], b'/' | b'*') {
+            let start = i;
+            if bytes[i + 1] == b'/' {
+                i += 2;
+                while i < bytes.len() && !matches!(bytes[i], b'\r' | b'\n') {
+                    i += 1;
+                }
+            } else {
+                i += 2;
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(bytes.len());
+            }
+            for b in &mut masked[start..i] {
+                if !matches!(*b, b'\r' | b'\n') {
+                    *b = b' ';
+                }
+            }
+            continue;
+        }
+        if matches!(bytes[i], b'\'' | b'"') {
+            let start = i;
+            let quote = bytes[i];
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\\' {
+                    i = (i + 2).min(bytes.len());
+                } else if bytes[i] == quote {
+                    i += 1;
+                    break;
+                } else {
+                    i += 1;
+                }
+            }
+            for b in &mut masked[start..i] {
+                if !matches!(*b, b'\r' | b'\n') {
+                    *b = b' ';
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+
+    for (keyword, kind) in [
+        ("@use", SassDirectiveKind::Use),
+        ("@forward", SassDirectiveKind::Forward),
+    ] {
+        let mut cursor = 0;
+        while let Some(rel) = find_token(&masked, cursor, keyword.as_bytes()) {
+            let at = rel;
+            let mut p = at + keyword.len();
+            while p < bytes.len() && bytes[p].is_ascii_whitespace() {
+                p += 1;
+            }
+            if p >= bytes.len() || !matches!(bytes[p], b'\'' | b'"') {
+                cursor = p.max(at + 1);
+                continue;
+            }
+            let quote = bytes[p];
+            let path_start = p + 1;
+            p += 1;
+            while p < bytes.len() && bytes[p] != quote {
+                if bytes[p] == b'\\' {
+                    p = (p + 2).min(bytes.len());
+                } else {
+                    p += 1;
+                }
+            }
+            if p >= bytes.len() {
+                break;
+            }
+            let path_end = p;
+            let mut end = p + 1;
+            let mut depth = 0usize;
+            while end < bytes.len() {
+                match bytes[end] {
+                    b'(' => depth += 1,
+                    b')' => depth = depth.saturating_sub(1),
+                    b';' if depth == 0 => {
+                        end += 1;
+                        break;
+                    }
+                    _ => {}
+                }
+                end += 1;
+            }
+            let tail = &source[p + 1..end];
+            let words: Vec<&str> = tail.trim_end_matches(';').split_whitespace().collect();
+            let mut namespace = None;
+            let mut star = false;
+            let mut prefix = None;
+            if kind == SassDirectiveKind::Use {
+                if let Some(pos) = words.iter().position(|w| *w == "as") {
+                    if let Some(value) = words.get(pos + 1) {
+                        if *value == "*" {
+                            star = true
+                        } else {
+                            namespace = Some(trim_sass_name(value).into());
+                        }
+                    }
+                } else {
+                    namespace = default_namespace(&source[path_start..path_end]);
+                }
+            } else if let Some(pos) = words.iter().position(|w| *w == "as") {
+                prefix = words
+                    .get(pos + 1)
+                    .map(|v| trim_sass_name(v).trim_end_matches('*').to_string());
+            }
+            let show = directive_names(&words, "show");
+            let hide = directive_names(&words, "hide");
+            let member_spans = directive_member_spans(source, p + 1, end);
+            facts.sass_directives.push(SassDirective {
+                kind,
+                path: source[path_start..path_end].into(),
+                path_span: Span {
+                    start: path_start,
+                    end: path_end,
+                },
+                statement_span: Span { start: at, end },
+                namespace,
+                star,
+                prefix,
+                show,
+                hide,
+                member_spans,
+            });
+            cursor = end.max(at + 1);
+        }
+    }
+
+    let mut declaration_spans = Vec::new();
+    for (keyword, kind, sigil) in [
+        ("@mixin", SassSymbolKind::Mixin, false),
+        ("@function", SassSymbolKind::Function, false),
+    ] {
+        let mut cursor = 0;
+        while let Some(at) = find_token(&masked, cursor, keyword.as_bytes()) {
+            let mut p = at + keyword.len();
+            while p < bytes.len() && bytes[p].is_ascii_whitespace() {
+                p += 1;
+            }
+            let start = p;
+            while p < bytes.len() && sass_ident(bytes[p]) {
+                p += 1;
+            }
+            if p > start {
+                push_sass_declaration(source, facts, kind, start, p);
+                declaration_spans.push(Span { start, end: p });
+            }
+            cursor = p.max(at + 1);
+            let _ = sigil;
+        }
+    }
+    i = 0;
+    while i < bytes.len() {
+        if masked[i] == b'$' {
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len() && sass_ident(bytes[end]) {
+                end += 1;
+            }
+            if end > start {
+                let mut p = end;
+                while p < bytes.len() && bytes[p].is_ascii_whitespace() {
+                    p += 1;
+                }
+                let before = source[..i].trim_end().as_bytes().last().copied();
+                if p < bytes.len()
+                    && bytes[p] == b':'
+                    && before.is_none_or(|b| matches!(b, b';' | b'{' | b'}'))
+                    && !facts
+                        .sass_directives
+                        .iter()
+                        .any(|d| d.statement_span.start <= i && i < d.statement_span.end)
+                {
+                    push_sass_declaration(source, facts, SassSymbolKind::Variable, start, end);
+                    declaration_spans.push(Span { start, end });
+                }
+            }
+            i = end.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+
+    i = 0;
+    while i < bytes.len() {
+        if masked[i] == b'$' {
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len() && sass_ident(bytes[end]) {
+                end += 1;
+            }
+            if end > start && !declaration_spans.iter().any(|s| s.start == start) {
+                let (namespace, name_start) = namespace_before(source, i);
+                facts.sass_references.push(SassReference {
+                    name: source[start..end].into(),
+                    span: Span { start, end },
+                    kind: SassSymbolKind::Variable,
+                    namespace: namespace
+                        .or_else(|| (name_start < i).then(|| source[name_start..i - 1].into())),
+                });
+            }
+            i = end.max(i + 1);
+            continue;
+        }
+        if bytes.get(i..i + 8) == Some(b"@include") && token_boundary(bytes, i, i + 8) {
+            let mut p = i + 8;
+            while p < bytes.len() && bytes[p].is_ascii_whitespace() {
+                p += 1;
+            }
+            let (namespace, start) = parse_qualified_name(source, p);
+            let mut end = start;
+            while end < bytes.len() && sass_ident(bytes[end]) {
+                end += 1;
+            }
+            if end > start {
+                facts.sass_references.push(SassReference {
+                    name: source[start..end].into(),
+                    span: Span { start, end },
+                    kind: SassSymbolKind::Mixin,
+                    namespace,
+                });
+            }
+            i = end.max(i + 1);
+            continue;
+        }
+        if (masked[i].is_ascii_alphabetic() || masked[i] == b'_')
+            && (i == 0 || !sass_ident(masked[i - 1]))
+        {
+            let (namespace, start) = parse_qualified_name(source, i);
+            let mut end = start;
+            while end < bytes.len() && sass_ident(bytes[end]) {
+                end += 1;
+            }
+            let mut p = end;
+            while p < bytes.len() && bytes[p].is_ascii_whitespace() {
+                p += 1;
+            }
+            if end > start
+                && p < bytes.len()
+                && bytes[p] == b'('
+                && !declaration_spans.iter().any(|span| span.start == start)
+                && !source[..i].ends_with("@function ")
+                && !source[..i].ends_with("@mixin ")
+            {
+                facts.sass_references.push(SassReference {
+                    name: source[start..end].into(),
+                    span: Span { start, end },
+                    kind: SassSymbolKind::Function,
+                    namespace,
+                });
+            }
+            i = end.max(i + 1);
+            continue;
+        }
+        i += 1;
+    }
+}
+
+fn find_token(bytes: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
+    (from..=bytes.len().saturating_sub(needle.len())).find(|&i| {
+        bytes.get(i..i + needle.len()) == Some(needle) && token_boundary(bytes, i, i + needle.len())
+    })
+}
+fn token_boundary(bytes: &[u8], start: usize, end: usize) -> bool {
+    (start == 0 || !sass_ident(bytes[start - 1])) && (end == bytes.len() || !sass_ident(bytes[end]))
+}
+fn sass_ident(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-') || b >= 0x80
+}
+fn trim_sass_name(value: &str) -> &str {
+    value.trim_matches(|c: char| c == ',' || c == ';')
+}
+fn default_namespace(path: &str) -> Option<String> {
+    path.rsplit('/')
+        .next()
+        .map(|s| {
+            s.trim_end_matches(".scss")
+                .trim_start_matches('_')
+                .to_string()
+        })
+        .filter(|s| !s.is_empty())
+}
+fn directive_names(words: &[&str], key: &str) -> Vec<String> {
+    words
+        .iter()
+        .position(|w| *w == key)
+        .map(|p| {
+            words[p + 1..]
+                .iter()
+                .take_while(|w| !matches!(**w, "with" | "as" | "show" | "hide"))
+                .map(|w| trim_sass_name(w).trim_start_matches('$').to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+fn directive_member_spans(source: &str, start: usize, end: usize) -> Vec<(String, Span)> {
+    let bytes = source.as_bytes();
+    let mut out = Vec::new();
+    let mut i = start;
+    let mut collecting = false;
+    while i < end {
+        while i < end && (bytes[i].is_ascii_whitespace() || bytes[i] == b',') {
+            i += 1;
+        }
+        if i < end && bytes[i] == b'$' {
+            let name_start = i + 1;
+            i = name_start;
+            while i < end && sass_ident(bytes[i]) {
+                i += 1;
+            }
+            let mut after = i;
+            while after < end && bytes[after].is_ascii_whitespace() {
+                after += 1;
+            }
+            if i > name_start && after < end && bytes[after] == b':' {
+                out.push((
+                    source[name_start..i].into(),
+                    Span {
+                        start: name_start,
+                        end: i,
+                    },
+                ));
+            }
+            continue;
+        }
+        let word_start = i;
+        let name_start = i;
+        while i < end && sass_ident(bytes[i]) {
+            i += 1;
+        }
+        if i == name_start {
+            i += 1;
+            continue;
+        }
+        let word = &source[name_start..i];
+        if matches!(word, "show" | "hide") {
+            collecting = true;
+            continue;
+        }
+        if matches!(word, "as" | "with") {
+            collecting = false;
+            continue;
+        }
+        if collecting {
+            out.push((
+                word.into(),
+                Span {
+                    start: name_start,
+                    end: i,
+                },
+            ));
+        }
+        if i == word_start {
+            i += 1;
+        }
+    }
+    out
+}
+fn push_sass_declaration(
+    source: &str,
+    facts: &mut StylesheetFacts,
+    kind: SassSymbolKind,
+    start: usize,
+    end: usize,
+) {
+    let name = source[start..end].to_string();
+    facts.sass_declarations.push(SassDeclaration {
+        private: name.starts_with(['-', '_']),
+        name,
+        span: Span { start, end },
+        kind,
+    });
+}
+fn parse_qualified_name(source: &str, start: usize) -> (Option<String>, usize) {
+    let bytes = source.as_bytes();
+    let mut p = start;
+    while p < bytes.len() && sass_ident(bytes[p]) {
+        p += 1;
+    }
+    if p < bytes.len() && bytes[p] == b'.' {
+        (Some(source[start..p].into()), p + 1)
+    } else {
+        (None, start)
+    }
+}
+fn namespace_before(source: &str, dollar: usize) -> (Option<String>, usize) {
+    if dollar == 0 || source.as_bytes()[dollar - 1] != b'.' {
+        return (None, dollar);
+    }
+    let mut start = dollar - 1;
+    while start > 0 && sass_ident(source.as_bytes()[start - 1]) {
+        start -= 1;
+    }
+    (Some(source[start..dollar - 1].into()), start)
 }
 
 fn collect_custom_property_facts(source: &str, facts: &mut StylesheetFacts) {
@@ -918,5 +1373,66 @@ mod tests {
             );
         }
         assert_eq!(facts.diagnostics.len(), 1);
+    }
+    #[test]
+    fn extracts_sass_symbols_and_module_directives() {
+        let source = r#"@use "src/tokens" as t with ($mode: dark);
+@forward "src/tools" as ui-* show helper, $gap;
+$local_value: t.$space;
+@mixin card-tone { color: $local-value; @include t.paint; }
+@function size-up($value) { @return t.scale($value); }
+.x { width: size_up($local-value); }"#;
+        let facts = parse_stylesheet(source);
+        assert!(
+            facts
+                .sass_declarations
+                .iter()
+                .any(|d| d.kind == SassSymbolKind::Variable && d.name == "local_value")
+        );
+        assert!(
+            facts
+                .sass_declarations
+                .iter()
+                .any(|d| d.kind == SassSymbolKind::Mixin && d.name == "card-tone")
+        );
+        assert!(
+            facts
+                .sass_declarations
+                .iter()
+                .any(|d| d.kind == SassSymbolKind::Function && d.name == "size-up")
+        );
+        assert!(
+            facts
+                .sass_references
+                .iter()
+                .any(|r| r.kind == SassSymbolKind::Variable
+                    && r.namespace.as_deref() == Some("t")
+                    && r.name == "space")
+        );
+        assert!(
+            facts
+                .sass_references
+                .iter()
+                .any(|r| r.kind == SassSymbolKind::Mixin
+                    && r.namespace.as_deref() == Some("t")
+                    && r.name == "paint")
+        );
+        assert!(
+            facts
+                .sass_references
+                .iter()
+                .any(|r| r.kind == SassSymbolKind::Function
+                    && r.namespace.as_deref() == Some("t")
+                    && r.name == "scale")
+        );
+        assert_eq!(facts.sass_directives.len(), 2);
+        assert!(
+            facts.sass_directives[0]
+                .member_spans
+                .iter()
+                .any(|(name, _)| name == "mode")
+        );
+        assert_eq!(facts.sass_directives[1].prefix.as_deref(), Some("ui-"));
+        assert_eq!(facts.sass_directives[1].show, ["helper", "gap"]);
     }
 }

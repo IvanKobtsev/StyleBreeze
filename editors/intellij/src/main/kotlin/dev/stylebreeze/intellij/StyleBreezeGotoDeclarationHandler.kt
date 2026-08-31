@@ -68,6 +68,17 @@ class StyleBreezeGotoDeclarationHandler : GotoDeclarationHandler {
                 } ?: continue
                 val recognized = !declaration.left.isNullOrEmpty() || !declaration.right.isNullOrEmpty()
                 if (!recognized) continue
+                val declarationTargets = buildList {
+                    declaration.left?.forEach { add(Target(it.uri, it.range)) }
+                    declaration.right?.forEach { add(Target(it.targetUri, it.targetSelectionRange)) }
+                }
+                val currentUri = client.getDocumentIdentifier(file).uri
+                val selectedDeclaration = declarationTargets.any { target ->
+                    target.uri == currentUri && target.range.contains(position)
+                }
+                if (!selectedDeclaration) {
+                    return mapTargets(client, declarationTargets).toTypedArray()
+                }
                 val references = request("references") {
                     client.sendRequestSync(2_000) { server ->
                         server.textDocumentService.references(
@@ -143,7 +154,7 @@ class StyleBreezeGotoDeclarationHandler : GotoDeclarationHandler {
 
         private fun isStylesheet(file: VirtualFile): Boolean {
             val name = file.name.lowercase()
-            return name.endsWith(".module.css") || name.endsWith(".module.scss")
+            return name.endsWith(".module.css") || name.endsWith(".scss")
         }
 
         private fun isCustomPropertyAt(text: CharSequence, offset: Int): Boolean {
@@ -237,6 +248,10 @@ private class StyleBreezeShowUsagesHandler(
 }
 
 private data class Target(val uri: String, val range: org.eclipse.lsp4j.Range)
+
+private fun org.eclipse.lsp4j.Range.contains(position: Position): Boolean =
+    (position.line > start.line || position.line == start.line && position.character >= start.character) &&
+        (position.line < end.line || position.line == end.line && position.character <= end.character)
 
 private fun VirtualFile.identity(): String = if (SystemInfoRt.isWindows) path.lowercase() else path
 

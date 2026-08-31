@@ -11,8 +11,8 @@ lsp-types.workspace = true
 serde_json.workspace = true
 stylebreeze-analysis = { path = "../analysis" }
 stylebreeze-protocol = { path = "../protocol" }
+stylebreeze-stylesheet-parser = { path = "../stylesheet-parser" }
 walkdir.workspace = true
 
 [lints]
 workspace = true
-

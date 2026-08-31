@@ -161,6 +161,18 @@ fn handle_notification(c: &Connection, p: &mut Project, n: Notification) -> Resu
                 .unwrap_or_default();
             p.set_global_selectors(selectors);
             p.set_property_presentation(presentation);
+            let sass_roots = settings
+                .get("scss")
+                .and_then(|v| v.get("loadPaths"))
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
+            p.set_sass_load_root_strings(sass_roots);
             publish_all(c, p)?;
         }
         _ => {}
@@ -223,15 +235,46 @@ fn handle_request(c: &Connection, p: &Project, r: Request) -> Result<()> {
                 q.text_document_position.position,
             )
             .unwrap_or(0);
+            let source = p.source(&path).unwrap_or("");
             let items: Vec<_> = p
-                .completions_at(&path, at)
+                .completion_items_at(&path, at)
                 .into_iter()
-                .map(|label| CompletionItem {
-                    sort_text: Some(format!("0000-{label}")),
+                .map(|item| CompletionItem {
+                    sort_text: Some(format!("0000-{}-{}", item.label, item.detail)),
                     preselect: Some(true),
-                    label,
-                    kind: Some(CompletionItemKind::FIELD),
-                    detail: Some("CSS Module export".into()),
+                    label: item.label.clone(),
+                    kind: Some(match item.kind {
+                        Some(stylebreeze_stylesheet_parser::SassSymbolKind::Variable) => {
+                            CompletionItemKind::VARIABLE
+                        }
+                        Some(stylebreeze_stylesheet_parser::SassSymbolKind::Mixin) => {
+                            CompletionItemKind::METHOD
+                        }
+                        Some(stylebreeze_stylesheet_parser::SassSymbolKind::Function) => {
+                            CompletionItemKind::FUNCTION
+                        }
+                        None => CompletionItemKind::FIELD,
+                    }),
+                    detail: Some(item.detail),
+                    text_edit: item.kind.map(|_| {
+                        CompletionTextEdit::Edit(lsp_types::TextEdit {
+                            range: span_to_range(source, item.replace_span),
+                            new_text: item.label.clone(),
+                        })
+                    }),
+                    additional_text_edits: (!item.additional_edits.is_empty()).then(|| {
+                        item.additional_edits
+                            .into_iter()
+                            .filter_map(|edit| {
+                                p.source(&edit.location.path).map(|edit_source| {
+                                    lsp_types::TextEdit {
+                                        range: span_to_range(edit_source, edit.location.span),
+                                        new_text: edit.new_text,
+                                    }
+                                })
+                            })
+                            .collect()
+                    }),
                     ..Default::default()
                 })
                 .collect();
@@ -299,6 +342,23 @@ fn handle_request(c: &Connection, p: &Project, r: Request) -> Result<()> {
                 })
             }).collect();
             Ok(serde_json::to_value(items)?)
+        }
+        "stylebreeze/fixSassImports" => {
+            let q: TextDocumentIdentifier = serde_json::from_value(r.params)?;
+            let path = q
+                .uri
+                .to_file_path()
+                .map_err(|_| anyhow::anyhow!("invalid file URI"))?;
+            let source = p.source(&path).unwrap_or("");
+            let edits: Vec<_> = p
+                .fix_sass_imports(&path)
+                .into_iter()
+                .map(|edit| lsp_types::TextEdit {
+                    range: span_to_range(source, edit.location.span),
+                    new_text: edit.new_text,
+                })
+                .collect();
+            Ok(serde_json::json!({ "version": p.version(&path), "edits": edits }))
         }
         req::PrepareRenameRequest::METHOD => {
             let q: TextDocumentPositionParams = serde_json::from_value(r.params)?;

@@ -6,7 +6,8 @@ use std::{
 };
 use stylebreeze_resolver::{FileSystemResolver, Resolver};
 use stylebreeze_stylesheet_parser::{
-    Scope, SelectorPreview, SelectorRule, UnsupportedReason, parse_stylesheet, preview_selector,
+    SassDirectiveKind, SassSymbolKind, Scope, SelectorPreview, SelectorRule, UnsupportedReason,
+    parse_stylesheet, preview_selector,
 };
 use stylebreeze_typescript_parser::{AccessKind, parse_typescript};
 use thiserror::Error;
@@ -41,6 +42,15 @@ pub struct Diagnostic {
 pub struct TextEdit {
     pub location: Location,
     pub new_text: String,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Completion {
+    pub label: String,
+    pub kind: Option<SassSymbolKind>,
+    pub detail: String,
+    pub replace_span: Span,
+    pub additional_edits: Vec<TextEdit>,
 }
 #[derive(Clone, Debug)]
 struct Export {
@@ -126,6 +136,33 @@ struct PropertyImport {
     names: Vec<(String, Span)>,
 }
 #[derive(Clone, Debug)]
+struct SassDeclaration {
+    name: String,
+    span: Span,
+    kind: SassSymbolKind,
+    private: bool,
+}
+#[derive(Clone, Debug)]
+struct SassReference {
+    name: String,
+    span: Span,
+    kind: SassSymbolKind,
+    namespace: Option<String>,
+}
+#[derive(Clone, Debug)]
+struct SassDependency {
+    kind: SassDirectiveKind,
+    source: Option<PathBuf>,
+    path: String,
+    path_span: Span,
+    namespace: Option<String>,
+    star: bool,
+    prefix: Option<String>,
+    show: Vec<String>,
+    hide: Vec<String>,
+    member_spans: Vec<(String, Span)>,
+}
+#[derive(Clone, Debug)]
 struct FileRecord {
     source: String,
     version: Option<i32>,
@@ -141,6 +178,9 @@ struct FileRecord {
     property_imports: Vec<PropertyImport>,
     property_exports: Vec<(String, Span)>,
     suppressed_lines: Vec<usize>,
+    sass_declarations: Vec<SassDeclaration>,
+    sass_references: Vec<SassReference>,
+    sass_dependencies: Vec<SassDependency>,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -161,6 +201,7 @@ pub struct Project {
     resolver: Box<dyn Resolver>,
     global_selectors: Vec<String>,
     property_presentation: HashMap<String, String>,
+    sass_load_roots: Vec<PathBuf>,
 }
 impl Default for Project {
     fn default() -> Self {
@@ -180,6 +221,7 @@ impl Default for Project {
             .into_iter()
             .map(|r| (r.into(), "semantic".into()))
             .collect(),
+            sass_load_roots: Vec::new(),
         }
     }
 }
@@ -187,9 +229,45 @@ impl Default for Project {
 impl Project {
     pub fn new(roots: Vec<PathBuf>) -> Self {
         Self {
+            sass_load_roots: roots.clone(),
             roots,
             ..Self::default()
         }
+    }
+    pub fn set_sass_load_roots(&mut self, roots: Vec<PathBuf>) {
+        let roots = if roots.is_empty() {
+            self.roots.clone()
+        } else {
+            roots
+        };
+        if roots == self.sass_load_roots {
+            return;
+        }
+        self.sass_load_roots = roots;
+        let files: Vec<_> = self
+            .files
+            .iter()
+            .map(|(p, f)| (p.clone(), f.source.clone(), f.version))
+            .collect();
+        for (path, source, version) in files {
+            self.open_or_update_file(path, source, version);
+        }
+    }
+    pub fn set_sass_load_root_strings(&mut self, roots: Vec<String>) {
+        let base = self.roots.first().cloned().unwrap_or_default();
+        self.set_sass_load_roots(
+            roots
+                .into_iter()
+                .map(|root| {
+                    let path = PathBuf::from(root);
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        base.join(path)
+                    }
+                })
+                .collect(),
+        );
     }
     pub fn index_workspace(&mut self) {
         let roots = self.roots.clone();
@@ -229,8 +307,71 @@ impl Project {
         let mut property_imports = Vec::new();
         let mut property_exports = Vec::new();
         let mut suppressed_lines = Vec::new();
+        let mut sass_declarations = Vec::new();
+        let mut sass_references = Vec::new();
+        let mut sass_dependencies = Vec::new();
         if stylesheet(&path) {
             let facts = parse_stylesheet(&source);
+            sass_declarations = facts
+                .sass_declarations
+                .iter()
+                .map(|d| SassDeclaration {
+                    name: d.name.clone(),
+                    span: Span {
+                        start: d.span.start,
+                        end: d.span.end,
+                    },
+                    kind: d.kind,
+                    private: d.private,
+                })
+                .collect();
+            sass_references = facts
+                .sass_references
+                .iter()
+                .map(|r| SassReference {
+                    name: r.name.clone(),
+                    span: Span {
+                        start: r.span.start,
+                        end: r.span.end,
+                    },
+                    kind: r.kind,
+                    namespace: r.namespace.clone(),
+                })
+                .collect();
+            sass_dependencies = facts
+                .sass_directives
+                .iter()
+                .map(|d| SassDependency {
+                    kind: d.kind,
+                    source: self
+                        .resolver
+                        .resolve_sass(&path, &d.path, &self.sass_load_roots)
+                        .ok(),
+                    path: d.path.clone(),
+                    path_span: Span {
+                        start: d.path_span.start,
+                        end: d.path_span.end,
+                    },
+                    namespace: d.namespace.clone(),
+                    star: d.star,
+                    prefix: d.prefix.clone(),
+                    show: d.show.clone(),
+                    hide: d.hide.clone(),
+                    member_spans: d
+                        .member_spans
+                        .iter()
+                        .map(|(name, span)| {
+                            (
+                                name.clone(),
+                                Span {
+                                    start: span.start,
+                                    end: span.end,
+                                },
+                            )
+                        })
+                        .collect(),
+                })
+                .collect();
             selectors = facts.selectors.clone();
             property_declarations = facts
                 .custom_property_declarations
@@ -446,6 +587,9 @@ impl Project {
                 property_imports,
                 property_exports,
                 suppressed_lines,
+                sass_declarations,
+                sass_references,
+                sass_dependencies,
             },
         );
     }
@@ -487,6 +631,19 @@ impl Project {
     }
     pub fn definitions_at(&self, path: &Path, offset: usize) -> Vec<Location> {
         let p = canonical_or(path.to_path_buf());
+        if let Some((origin, kind, name)) = self.sass_symbol_at(&p, offset) {
+            return self
+                .files
+                .get(&origin)
+                .into_iter()
+                .flat_map(|f| f.sass_declarations.iter())
+                .filter(|d| d.kind == kind && canonical_sass_name(&d.name) == name)
+                .map(|d| Location {
+                    path: origin.clone(),
+                    span: d.span,
+                })
+                .collect();
+        }
         if let Some((name, _)) = self.property_symbol_at(&p, offset) {
             if let Some(f) = self.files.get(&p) {
                 for import in &f.property_imports {
@@ -640,6 +797,58 @@ impl Project {
         include_declaration: bool,
     ) -> Vec<Location> {
         let p = canonical_or(path.to_path_buf());
+        if let Some((origin, kind, name)) = self.sass_symbol_at(&p, offset) {
+            let mut out = Vec::new();
+            for (file_path, file) in &self.files {
+                for reference in &file.sass_references {
+                    if reference.kind == kind
+                        && self
+                            .resolve_sass_reference(file_path, reference)
+                            .is_some_and(|(o, n)| o == origin && n == name)
+                    {
+                        out.push(Location {
+                            path: file_path.clone(),
+                            span: reference.span,
+                        });
+                    }
+                }
+                for dependency in &file.sass_dependencies {
+                    let Some(source) = &dependency.source else {
+                        continue;
+                    };
+                    for (member, span) in &dependency.member_spans {
+                        let member_name = canonical_sass_name(member);
+                        let kind_matches = dependency.kind == SassDirectiveKind::Forward
+                            || kind == SassSymbolKind::Variable;
+                        if kind_matches
+                            && self
+                                .sass_export_origin(source, kind, &member_name, &mut HashSet::new())
+                                .as_ref()
+                                == Some(&origin)
+                        {
+                            out.push(Location {
+                                path: file_path.clone(),
+                                span: *span,
+                            });
+                        }
+                    }
+                }
+            }
+            if include_declaration && let Some(file) = self.files.get(&origin) {
+                out.extend(
+                    file.sass_declarations
+                        .iter()
+                        .filter(|d| d.kind == kind && canonical_sass_name(&d.name) == name)
+                        .map(|d| Location {
+                            path: origin.clone(),
+                            span: d.span,
+                        }),
+                );
+            }
+            out.sort_by(|a, b| a.path.cmp(&b.path).then(a.span.start.cmp(&b.span.start)));
+            out.dedup();
+            return out;
+        }
         if let Some((name, _)) = self.property_symbol_at(&p, offset) {
             let roles = self.property_roles(&p, &name);
             let project_wide = roles.iter().any(|r| r == "global" || r == "registered");
@@ -747,6 +956,9 @@ impl Project {
     }
     pub fn prepare_rename(&self, path: &Path, offset: usize) -> Result<Span, RenameError> {
         let p = canonical_or(path.to_path_buf());
+        if self.sass_symbol_at(&p, offset).is_some() {
+            return self.sass_span_at(&p, offset).ok_or(RenameError::NoSymbol);
+        }
         if let Some((_, span)) = self.property_symbol_at(&p, offset) {
             return Ok(span);
         }
@@ -761,6 +973,29 @@ impl Project {
         new_name: &str,
     ) -> Result<Vec<TextEdit>, RenameError> {
         let p = canonical_or(path.to_path_buf());
+        if let Some((origin, kind, old_name)) = self.sass_symbol_at(&p, offset) {
+            let clean = new_name.trim_start_matches('$');
+            if !valid_sass_name(clean) {
+                return Err(RenameError::InvalidName);
+            }
+            if self.files.get(&origin).is_some_and(|f| {
+                f.sass_declarations.iter().any(|d| {
+                    d.kind == kind
+                        && canonical_sass_name(&d.name) == canonical_sass_name(clean)
+                        && canonical_sass_name(&d.name) != old_name
+                })
+            }) {
+                return Err(RenameError::Collision(clean.into()));
+            }
+            return Ok(self
+                .references_at(&p, offset, true)
+                .into_iter()
+                .map(|location| TextEdit {
+                    location,
+                    new_text: clean.into(),
+                })
+                .collect());
+        }
         if let Some((name, _)) = self.property_symbol_at(&p, offset) {
             if !valid_custom_property_name(new_name) {
                 return Err(RenameError::InvalidName);
@@ -1033,6 +1268,147 @@ impl Project {
         self.files
             .keys()
             .flat_map(|p| self.diagnostics_for(p))
+            .collect()
+    }
+    pub fn completion_items_at(&self, path: &Path, offset: usize) -> Vec<Completion> {
+        let path = canonical_or(path.to_path_buf());
+        let Some(file) = self.files.get(&path) else {
+            return Vec::new();
+        };
+        if let Some((kind, namespace, prefix, replace_span)) =
+            sass_completion_context(&file.source, offset)
+        {
+            let mut out = Vec::new();
+            let mut seen = HashSet::new();
+            for (source_path, source_file) in &self.files {
+                if source_path.extension().and_then(|e| e.to_str()) != Some("scss") {
+                    continue;
+                }
+                for declaration in &source_file.sass_declarations {
+                    if declaration.private
+                        || declaration.kind != kind
+                        || !canonical_sass_name(&declaration.name)
+                            .starts_with(&canonical_sass_name(&prefix))
+                    {
+                        continue;
+                    }
+                    if let Some(ns) = &namespace {
+                        let dependency_matches = file.sass_dependencies.iter().any(|d| {
+                            d.kind == SassDirectiveKind::Use
+                                && d.namespace.as_deref() == Some(ns)
+                                && d.source.as_ref() == Some(source_path)
+                        });
+                        if !dependency_matches {
+                            continue;
+                        }
+                    }
+                    let fake = SassReference {
+                        name: declaration.name.clone(),
+                        span: replace_span,
+                        kind,
+                        namespace: namespace.clone(),
+                    };
+                    let visible = self
+                        .resolve_sass_reference(&path, &fake)
+                        .is_some_and(|(origin, _)| origin == *source_path);
+                    let mut additional_edits = Vec::new();
+                    if !visible
+                        && namespace.is_none()
+                        && source_path != &path
+                        && !file
+                            .sass_dependencies
+                            .iter()
+                            .any(|d| d.source.as_ref() == Some(source_path))
+                        && let Some(specifier) = self
+                            .resolver
+                            .sass_specifier(source_path, &self.sass_load_roots)
+                    {
+                        additional_edits.push(TextEdit {
+                            location: Location {
+                                path: path.clone(),
+                                span: Span {
+                                    start: sass_import_insertion_offset(&file.source),
+                                    end: sass_import_insertion_offset(&file.source),
+                                },
+                            },
+                            new_text: format!(
+                                "@use \"{specifier}\" as *;{}",
+                                newline(&file.source)
+                            ),
+                        });
+                    }
+                    if visible
+                        || !additional_edits.is_empty()
+                        || namespace.is_some()
+                        || source_path == &path
+                    {
+                        let identity = (declaration.name.clone(), source_path.clone());
+                        if seen.insert(identity) {
+                            out.push(Completion {
+                                label: declaration.name.clone(),
+                                kind: Some(kind),
+                                detail: format!(
+                                    "{} — {}",
+                                    sass_kind_name(kind),
+                                    self.resolver
+                                        .sass_specifier(source_path, &self.sass_load_roots)
+                                        .unwrap_or_else(|| source_path.display().to_string())
+                                ),
+                                replace_span,
+                                additional_edits,
+                            });
+                        }
+                    }
+                }
+            }
+            out.sort_by(|a, b| a.label.cmp(&b.label).then(a.detail.cmp(&b.detail)));
+            return out;
+        }
+        self.completions_at(path.as_path(), offset)
+            .into_iter()
+            .map(|label| Completion {
+                label,
+                kind: None,
+                detail: "CSS Module export".into(),
+                replace_span: Span {
+                    start: offset,
+                    end: offset,
+                },
+                additional_edits: Vec::new(),
+            })
+            .collect()
+    }
+    pub fn fix_sass_imports(&self, path: &Path) -> Vec<TextEdit> {
+        let path = canonical_or(path.to_path_buf());
+        let Some(file) = self.files.get(&path) else {
+            return Vec::new();
+        };
+        file.sass_dependencies
+            .iter()
+            .filter(|d| d.path.starts_with('.'))
+            .filter_map(|dependency| {
+                let target = dependency.source.as_ref()?;
+                let mut specifier = self
+                    .resolver
+                    .sass_specifier(target, &self.sass_load_roots)?;
+                if Path::new(&dependency.path).extension().is_none() {
+                    specifier = specifier.trim_end_matches(".scss").to_string();
+                    if let Some((parent, name)) = specifier.rsplit_once('/')
+                        && let Some(name) = name.strip_prefix('_')
+                    {
+                        specifier = format!("{parent}/{name}");
+                    } else if let Some(name) = specifier.strip_prefix('_') {
+                        specifier = name.to_string();
+                    }
+                }
+                (specifier != dependency.path).then(|| TextEdit {
+                    location: Location {
+                        path: path.clone(),
+                        span: dependency.path_span,
+                    },
+                    new_text: specifier,
+                })
+            })
             .collect()
     }
     pub fn completions_at(&self, path: &Path, offset: usize) -> Vec<String> {
@@ -1365,6 +1741,167 @@ impl Project {
         out.dedup();
         out
     }
+    fn sass_span_at(&self, path: &Path, offset: usize) -> Option<Span> {
+        let file = self.files.get(path)?;
+        file.sass_declarations
+            .iter()
+            .find(|d| inside(d.span, offset))
+            .map(|d| d.span)
+            .or_else(|| {
+                file.sass_references
+                    .iter()
+                    .find(|r| inside(r.span, offset))
+                    .map(|r| r.span)
+            })
+            .or_else(|| {
+                file.sass_dependencies
+                    .iter()
+                    .flat_map(|d| d.member_spans.iter())
+                    .find(|(_, span)| inside(*span, offset))
+                    .map(|(_, span)| *span)
+            })
+    }
+    fn sass_symbol_at(
+        &self,
+        path: &Path,
+        offset: usize,
+    ) -> Option<(PathBuf, SassSymbolKind, String)> {
+        let file = self.files.get(path)?;
+        if let Some(d) = file
+            .sass_declarations
+            .iter()
+            .find(|d| inside(d.span, offset))
+        {
+            return Some((path.to_path_buf(), d.kind, canonical_sass_name(&d.name)));
+        }
+        let reference = file.sass_references.iter().find(|r| inside(r.span, offset));
+        if let Some(reference) = reference
+            && let Some((origin, name)) = self.resolve_sass_reference(path, reference)
+        {
+            return Some((origin, reference.kind, name));
+        }
+        for dependency in &file.sass_dependencies {
+            let Some(source) = &dependency.source else {
+                continue;
+            };
+            if let Some((member, _)) = dependency
+                .member_spans
+                .iter()
+                .find(|(_, span)| inside(*span, offset))
+            {
+                let name = canonical_sass_name(member);
+                let kinds: &[SassSymbolKind] = if dependency.kind == SassDirectiveKind::Use {
+                    &[SassSymbolKind::Variable]
+                } else {
+                    &[
+                        SassSymbolKind::Variable,
+                        SassSymbolKind::Mixin,
+                        SassSymbolKind::Function,
+                    ]
+                };
+                let mut matches = kinds
+                    .iter()
+                    .copied()
+                    .filter_map(|kind| {
+                        self.sass_export_origin(source, kind, &name, &mut HashSet::new())
+                            .map(|origin| (origin, kind, name.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                if matches.len() == 1 {
+                    return matches.pop();
+                }
+            }
+        }
+        None
+    }
+    fn resolve_sass_reference(
+        &self,
+        path: &Path,
+        reference: &SassReference,
+    ) -> Option<(PathBuf, String)> {
+        let name = canonical_sass_name(&reference.name);
+        let file = self.files.get(path)?;
+        if reference.namespace.is_none()
+            && file
+                .sass_declarations
+                .iter()
+                .any(|d| d.kind == reference.kind && canonical_sass_name(&d.name) == name)
+        {
+            return Some((path.to_path_buf(), name));
+        }
+        let mut matches = Vec::new();
+        for dependency in file
+            .sass_dependencies
+            .iter()
+            .filter(|d| d.kind == SassDirectiveKind::Use)
+        {
+            let visible = match &reference.namespace {
+                Some(ns) => dependency.namespace.as_deref() == Some(ns),
+                None => dependency.star,
+            };
+            if !visible {
+                continue;
+            }
+            if let Some(source) = &dependency.source
+                && let Some(origin) =
+                    self.sass_export_origin(source, reference.kind, &name, &mut HashSet::new())
+            {
+                matches.push(origin);
+            }
+        }
+        matches.sort();
+        matches.dedup();
+        (matches.len() == 1).then(|| (matches.remove(0), name))
+    }
+    fn sass_export_origin(
+        &self,
+        path: &Path,
+        kind: SassSymbolKind,
+        requested: &str,
+        seen: &mut HashSet<PathBuf>,
+    ) -> Option<PathBuf> {
+        let path = canonical_or(path.to_path_buf());
+        if !seen.insert(path.clone()) {
+            return None;
+        }
+        let file = self.files.get(&path)?;
+        if file
+            .sass_declarations
+            .iter()
+            .any(|d| !d.private && d.kind == kind && canonical_sass_name(&d.name) == requested)
+        {
+            return Some(path);
+        }
+        let mut origins = Vec::new();
+        for dep in file
+            .sass_dependencies
+            .iter()
+            .filter(|d| d.kind == SassDirectiveKind::Forward)
+        {
+            let mut inner = requested.to_string();
+            if let Some(prefix) = &dep.prefix {
+                let prefix = canonical_sass_name(prefix);
+                if !inner.starts_with(&prefix) {
+                    continue;
+                }
+                inner = inner[prefix.len()..].to_string();
+            }
+            if !dep.show.is_empty() && !dep.show.iter().any(|n| canonical_sass_name(n) == inner) {
+                continue;
+            }
+            if dep.hide.iter().any(|n| canonical_sass_name(n) == inner) {
+                continue;
+            }
+            if let Some(source) = &dep.source
+                && let Some(origin) = self.sass_export_origin(source, kind, &inner, seen)
+            {
+                origins.push(origin);
+            }
+        }
+        origins.sort();
+        origins.dedup();
+        (origins.len() == 1).then(|| origins.remove(0))
+    }
     fn property_symbol_at(&self, path: &Path, offset: usize) -> Option<(String, Span)> {
         let f = self.files.get(path)?;
         for d in &f.property_declarations {
@@ -1568,6 +2105,15 @@ fn valid_name(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
         && !s.as_bytes()[0].is_ascii_digit()
 }
+fn canonical_sass_name(s: &str) -> String {
+    s.trim_start_matches('$').replace('_', "-")
+}
+fn valid_sass_name(s: &str) -> bool {
+    !s.is_empty()
+        && !s.as_bytes()[0].is_ascii_digit()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-') || b >= 0x80)
+}
 fn valid_custom_property_name(s: &str) -> bool {
     s.starts_with("--") && s.len() > 2 && s[2..].bytes().all(ident_member_or_dash)
 }
@@ -1618,6 +2164,108 @@ fn var_context(source: &str, offset: usize) -> Option<&str> {
     } else {
         None
     }
+}
+fn sass_completion_context(
+    source: &str,
+    offset: usize,
+) -> Option<(SassSymbolKind, Option<String>, String, Span)> {
+    if offset > source.len() || !source.is_char_boundary(offset) {
+        return None;
+    }
+    let bytes = source.as_bytes();
+    let mut start = offset;
+    while start > 0 && sass_name_byte(bytes[start - 1]) {
+        start -= 1;
+    }
+    let prefix = source[start..offset].to_string();
+    if start > 0 && bytes[start - 1] == b'$' {
+        let namespace = if start > 1 && bytes[start - 2] == b'.' {
+            let mut ns_start = start - 2;
+            while ns_start > 0 && sass_name_byte(bytes[ns_start - 1]) {
+                ns_start -= 1;
+            }
+            Some(source[ns_start..start - 2].into())
+        } else {
+            None
+        };
+        return Some((
+            SassSymbolKind::Variable,
+            namespace,
+            prefix,
+            Span { start, end: offset },
+        ));
+    }
+    let line_start = source[..start].rfind(['\n', '\r']).map_or(0, |p| p + 1);
+    let head = source[line_start..start].trim_start();
+    if let Some(rest) = head.strip_prefix("@include") {
+        let namespace = rest
+            .trim()
+            .strip_suffix('.')
+            .map(str::to_string)
+            .filter(|s| !s.is_empty());
+        return Some((
+            SassSymbolKind::Mixin,
+            namespace,
+            prefix,
+            Span { start, end: offset },
+        ));
+    }
+    let namespace = if start > 0 && bytes[start - 1] == b'.' {
+        let mut ns_start = start - 1;
+        while ns_start > 0 && sass_name_byte(bytes[ns_start - 1]) {
+            ns_start -= 1;
+        }
+        Some(source[ns_start..start - 1].into())
+    } else {
+        None
+    };
+    let before = source[..start].trim_end();
+    if namespace.is_some()
+        || before.ends_with([':', '(', ',', '=', '+', '-', '*', '/'])
+        || before.rsplit_once(':').is_some()
+    {
+        return Some((
+            SassSymbolKind::Function,
+            namespace,
+            prefix,
+            Span { start, end: offset },
+        ));
+    }
+    None
+}
+fn sass_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-') || b >= 0x80
+}
+fn sass_kind_name(kind: SassSymbolKind) -> &'static str {
+    match kind {
+        SassSymbolKind::Variable => "Sass variable",
+        SassSymbolKind::Mixin => "Sass mixin",
+        SassSymbolKind::Function => "Sass function",
+    }
+}
+fn newline(source: &str) -> &'static str {
+    if source.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+fn sass_import_insertion_offset(source: &str) -> usize {
+    let facts = parse_stylesheet(source);
+    let mut end = facts
+        .sass_directives
+        .iter()
+        .map(|d| d.statement_span.end)
+        .max()
+        .unwrap_or(0);
+    if end == 0 && source.trim_start().starts_with("@charset") {
+        let leading = source.len() - source.trim_start().len();
+        end = source[leading..].find(';').map_or(0, |p| leading + p + 1);
+    }
+    while end < source.len() && matches!(source.as_bytes()[end], b'\r' | b'\n') {
+        end += 1;
+    }
+    end
 }
 fn property_prefix(source: &str, offset: usize) -> &str {
     if offset > source.len() {
@@ -1990,5 +2638,56 @@ mod tests {
                 || &css_source[diagnostic.location.span.start..diagnostic.location.span.end]
                     != "active"
         }));
+    }
+    #[test]
+    fn sass_graph_navigation_rename_completion_and_import_fixing() {
+        let d = tempdir().unwrap();
+        let tokens = d.path().join("src/styles/_tokens.scss");
+        let barrel = d.path().join("src/styles/index.scss");
+        let card = d.path().join("src/card.scss");
+        fs::create_dir_all(tokens.parent().unwrap()).unwrap();
+        fs::write(
+            &tokens,
+            "$space_value: 1rem;\n@mixin paint {}\n@function scale($v) { @return $v; }",
+        )
+        .unwrap();
+        fs::write(&barrel, "@forward \"./tokens\";").unwrap();
+        let source = "@use \"./styles/index.scss\" as *;\n.x { gap: $space-value; @include paint; width: scale(2); }";
+        fs::write(&card, source).unwrap();
+        let mut p = Project::new(vec![d.path().into()]);
+        p.index_workspace();
+        let use_offset = source.find("space-value").unwrap();
+        assert_eq!(
+            p.definition_at(&card, use_offset).unwrap().path,
+            tokens.canonicalize().unwrap()
+        );
+        let declaration_offset = p.source(&tokens).unwrap().find("space_value").unwrap();
+        assert_eq!(p.references_at(&tokens, declaration_offset, false).len(), 1);
+        assert_eq!(
+            p.rename(&tokens, declaration_offset, "spacing")
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            p.fix_sass_imports(&card)[0].new_text,
+            "src/styles/index.scss"
+        );
+
+        let fresh = d.path().join("src/fresh.scss");
+        fs::write(&fresh, ".x { gap: $spa }").unwrap();
+        p.open_or_update_file(fresh.clone(), fs::read_to_string(&fresh).unwrap(), Some(1));
+        let completion_offset = p.source(&fresh).unwrap().find("spa }").unwrap() + 3;
+        let item = p
+            .completion_items_at(&fresh, completion_offset)
+            .into_iter()
+            .find(|i| i.label == "space_value")
+            .unwrap();
+        assert_eq!(item.additional_edits.len(), 1);
+        assert!(
+            item.additional_edits[0]
+                .new_text
+                .contains("@use \"src/styles/tokens.scss\" as *;")
+        );
     }
 }

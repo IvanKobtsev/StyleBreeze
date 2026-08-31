@@ -26,9 +26,9 @@ class StyleBreezeCompletionContributor : CompletionContributor() {
         val clients = LspClientManager.getInstance(parameters.originalFile.project)
             .getClients(StyleBreezeLspProvider::class.java)
             .filter { it.descriptor.isSupportedFile(file) }
-
         for (client in clients) {
             val response = request {
+                publishSassSettings(parameters.originalFile.project)
                 client.sendRequestSync(2_000) { server ->
                     server.textDocumentService.completion(
                         CompletionParams(client.getDocumentIdentifier(file), position),
@@ -37,9 +37,19 @@ class StyleBreezeCompletionContributor : CompletionContributor() {
             } ?: continue
             val items = response.left ?: response.right?.items.orEmpty()
             if (items.isEmpty()) continue
-            items.distinctBy { it.label }.forEach { item ->
+            items.distinctBy { "${it.label}:${it.detail}" }.forEach { item ->
                 val lookup = LookupElementBuilder.create(item.label)
-                    .withTypeText(if (item.label.startsWith("--")) "StyleBreeze custom property" else "StyleBreeze CSS Module", true)
+                    .withTypeText(item.detail ?: if (item.label.startsWith("--")) "StyleBreeze custom property" else "StyleBreeze CSS Module", true)
+                    .withInsertHandler { context, _ ->
+                        item.additionalTextEdits.orEmpty()
+                            .mapNotNull { edit ->
+                                val start = context.document.offset(edit.range.start) ?: return@mapNotNull null
+                                val end = context.document.offset(edit.range.end) ?: return@mapNotNull null
+                                Triple(start, end, edit.newText)
+                            }
+                            .sortedByDescending { it.first }
+                            .forEach { (start, end, text) -> context.document.replaceString(start, end, text) }
+                    }
                 result.addElement(PrioritizedLookupElement.withPriority(lookup, PRIORITY))
             }
             // StyleBreeze knows the exact module at this member access, so avoid
@@ -62,4 +72,11 @@ class StyleBreezeCompletionContributor : CompletionContributor() {
         private const val PRIORITY = 1_000_000.0
         private val log = Logger.getInstance(StyleBreezeCompletionContributor::class.java)
     }
+}
+
+private fun com.intellij.openapi.editor.Document.offset(position: Position): Int? {
+    if (position.line !in 0 until lineCount) return null
+    val start = getLineStartOffset(position.line)
+    val end = getLineEndOffset(position.line)
+    return (start + position.character).coerceIn(start, end)
 }

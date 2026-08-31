@@ -784,6 +784,7 @@ dependencies = [
  "serde_json",
  "stylebreeze-analysis",
  "stylebreeze-protocol",
+ "stylebreeze-stylesheet-parser",
  "walkdir",
 ]
 

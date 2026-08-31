@@ -18,6 +18,13 @@ pub enum ResolveError {
 pub trait Resolver: Send + Sync {
     fn resolve_stylesheet(&self, importer: &Path, specifier: &str)
     -> Result<PathBuf, ResolveError>;
+    fn resolve_sass(
+        &self,
+        importer: &Path,
+        specifier: &str,
+        load_roots: &[PathBuf],
+    ) -> Result<PathBuf, ResolveError>;
+    fn sass_specifier(&self, target: &Path, load_roots: &[PathBuf]) -> Option<String>;
 }
 
 #[derive(Default)]
@@ -88,6 +95,86 @@ impl Resolver for FileSystemResolver {
         }
         Err(ResolveError::UnmappedAlias(specifier.into()))
     }
+
+    fn resolve_sass(
+        &self,
+        importer: &Path,
+        specifier: &str,
+        load_roots: &[PathBuf],
+    ) -> Result<PathBuf, ResolveError> {
+        if specifier.contains("#{")
+            || specifier.starts_with("sass:")
+            || specifier.starts_with("http:")
+            || specifier.starts_with("https:")
+        {
+            return Err(ResolveError::UnmappedAlias(specifier.into()));
+        }
+        let path = Path::new(specifier);
+        let mut bases = Vec::new();
+        if specifier.starts_with('.') {
+            bases.push(
+                importer
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(path),
+            );
+        } else {
+            bases.extend(load_roots.iter().map(|root| root.join(path)));
+        }
+        for base in bases {
+            if let Some(found) = resolve_sass_candidate(&base) {
+                return Ok(found);
+            }
+        }
+        Err(ResolveError::NotFound(specifier.into()))
+    }
+
+    fn sass_specifier(&self, target: &Path, load_roots: &[PathBuf]) -> Option<String> {
+        let target = target
+            .canonicalize()
+            .unwrap_or_else(|_| target.to_path_buf());
+        load_roots
+            .iter()
+            .enumerate()
+            .filter_map(|(order, root)| {
+                let root = root.canonicalize().unwrap_or_else(|_| root.clone());
+                target.strip_prefix(root).ok().map(|relative| {
+                    let mut value = relative.to_string_lossy().replace('\\', "/");
+                    if let Some((parent, name)) = value.rsplit_once('/') {
+                        if let Some(name) = name.strip_prefix('_') {
+                            value = format!("{parent}/{name}");
+                        }
+                    } else if let Some(name) = value.strip_prefix('_') {
+                        value = name.to_string();
+                    }
+                    (value.len(), order, value)
+                })
+            })
+            .min()
+            .map(|(_, _, value)| value)
+    }
+}
+
+fn resolve_sass_candidate(base: &Path) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    candidates.push(base.to_path_buf());
+    if base.extension().is_none() {
+        candidates.push(base.with_extension("scss"));
+        if let Some(name) = base.file_name().and_then(|n| n.to_str()) {
+            candidates.push(base.with_file_name(format!("_{name}.scss")));
+        }
+        candidates.push(base.join("index.scss"));
+        candidates.push(base.join("_index.scss"));
+    } else if base.extension().and_then(|e| e.to_str()) == Some("scss")
+        && let Some(name) = base.file_stem().and_then(|n| n.to_str())
+        && !name.starts_with('_')
+    {
+        candidates.push(base.with_file_name(format!("_{name}.scss")));
+    }
+    candidates
+        .into_iter()
+        .find(|p| p.is_file())
+        .and_then(|p| p.canonicalize().ok())
 }
 
 impl FileSystemResolver {
@@ -234,5 +321,36 @@ mod tests {
             .resolve_stylesheet(&importer, "@/styles/myStyles.module.scss")
             .unwrap();
         assert_eq!(resolved, stylesheet.canonicalize().unwrap());
+    }
+    #[test]
+    fn resolves_sass_partials_indexes_and_formats_root_specifiers() {
+        let dir = tempdir().unwrap();
+        let styles = dir.path().join("src/styles");
+        fs::create_dir_all(styles.join("tools")).unwrap();
+        let partial = styles.join("_tokens.scss");
+        let index = styles.join("tools/_index.scss");
+        fs::write(&partial, "$space: 1rem;").unwrap();
+        fs::write(&index, "@mixin paint {}").unwrap();
+        let importer = dir.path().join("src/card.scss");
+        fs::write(&importer, "").unwrap();
+        let resolver = FileSystemResolver::default();
+        assert_eq!(
+            resolver
+                .resolve_sass(&importer, "src/styles/tokens", &[dir.path().into()])
+                .unwrap(),
+            partial.canonicalize().unwrap()
+        );
+        assert_eq!(
+            resolver
+                .resolve_sass(&importer, "src/styles/tools", &[dir.path().into()])
+                .unwrap(),
+            index.canonicalize().unwrap()
+        );
+        assert_eq!(
+            resolver
+                .sass_specifier(&partial, &[dir.path().into()])
+                .as_deref(),
+            Some("src/styles/tokens.scss")
+        );
     }
 }
