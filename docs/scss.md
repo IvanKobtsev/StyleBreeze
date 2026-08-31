@@ -56,8 +56,8 @@ The IntelliJ plugin launches the server with SCSS debug logging enabled. Server
 stderr records workspace indexing, SCSS fact counts, resolved dependency counts,
 configuration changes, definition/reference results, completion counts, and
 import-fix edits. The IntelliJ log additionally records navigation requests,
-protocol target counts, target mapping, and failures to load a URI, PSI file, or
-document.
+completion dispatches with connected-client and returned-item counts, protocol
+target counts, target mapping, and failures to load a URI, PSI file, or document.
 
 In IntelliJ/WebStorm, use **Help → Show Log in Explorer/Finder** and search for
 `StyleBreeze`. In VS Code, open **View → Output → StyleBreeze**; protocol tracing

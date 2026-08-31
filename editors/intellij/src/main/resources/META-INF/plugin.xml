@@ -20,6 +20,10 @@
         language="any"
         implementationClass="dev.stylebreeze.intellij.StyleBreezeCompletionContributor"
         order="first"/>
+    <completion.contributor
+        language="SCSS"
+        implementationClass="dev.stylebreeze.intellij.StyleBreezeScssCompletionContributor"
+        order="first"/>
     <codeInsight.lineMarkerProvider
         language="CSS"
         implementationClass="dev.stylebreeze.intellij.StyleBreezeModifierLineMarkerProvider"/>

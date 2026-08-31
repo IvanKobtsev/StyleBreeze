@@ -13,10 +13,23 @@ import org.eclipse.lsp4j.Position
 import java.util.concurrent.Callable
 import java.util.concurrent.TimeUnit
 
-/** Makes resolved StyleBreeze exports authoritative in a `styles.` completion. */
-class StyleBreezeCompletionContributor : CompletionContributor() {
+/** Keeps CSS-module completion available in languages without a dedicated contributor. */
+class StyleBreezeCompletionContributor : StyleBreezeCompletionContributorBase() {
+    override fun accepts(parameters: CompletionParameters): Boolean =
+        !parameters.originalFile.virtualFile?.extension.equals("scss", ignoreCase = true)
+}
+
+/** Ensures StyleBreeze participates in every SCSS completion session. */
+class StyleBreezeScssCompletionContributor : StyleBreezeCompletionContributorBase() {
+    override fun accepts(parameters: CompletionParameters): Boolean = true
+}
+
+abstract class StyleBreezeCompletionContributorBase : CompletionContributor() {
+    protected abstract fun accepts(parameters: CompletionParameters): Boolean
+
     override fun fillCompletionVariants(parameters: CompletionParameters, result: CompletionResultSet) {
         val file = parameters.originalFile.virtualFile ?: return
+        if (!accepts(parameters)) return
         if (!StyleBreezeLspProvider.supports(file)) return
         val document = parameters.editor.document
         val offset = parameters.offset
@@ -26,6 +39,7 @@ class StyleBreezeCompletionContributor : CompletionContributor() {
         val clients = LspClientManager.getInstance(parameters.originalFile.project)
             .getClients(StyleBreezeLspProvider::class.java)
             .filter { it.descriptor.isSupportedFile(file) }
+        log.info("StyleBreeze completion request file=${file.path} offset=$offset clients=${clients.size}")
         for (client in clients) {
             val response = request {
                 publishSassSettings(parameters.originalFile.project)
@@ -36,6 +50,7 @@ class StyleBreezeCompletionContributor : CompletionContributor() {
                 }
             } ?: continue
             val items = response.left ?: response.right?.items.orEmpty()
+            log.info("StyleBreeze completion response file=${file.path} items=${items.size}")
             if (items.isEmpty()) continue
             items.distinctBy { "${it.label}:${it.detail}" }.forEach { item ->
                 val lookup = LookupElementBuilder.create(item.label)
@@ -70,7 +85,7 @@ class StyleBreezeCompletionContributor : CompletionContributor() {
 
     companion object {
         private const val PRIORITY = 1_000_000.0
-        private val log = Logger.getInstance(StyleBreezeCompletionContributor::class.java)
+        private val log = Logger.getInstance(StyleBreezeCompletionContributorBase::class.java)
     }
 }
 
