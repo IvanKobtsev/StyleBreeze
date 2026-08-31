@@ -34,6 +34,7 @@ private class StyleBreezeDescriptor(project: Project) :
 
     override fun createCommandLine(): GeneralCommandLine =
         GeneralCommandLine(BundledServer.executable().toString(), "--stdio")
+            .withEnvironment("STYLEBREEZE_LOG", "debug")
 
     override val lspCustomization: LspCustomization = StyleBreezeLspCustomization
 

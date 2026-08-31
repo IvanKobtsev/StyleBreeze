@@ -56,6 +56,7 @@ class StyleBreezeGotoDeclarationHandler : GotoDeclarationHandler {
         val clients = LspClientManager.getInstance(element.project)
             .getClients(StyleBreezeLspProvider::class.java)
             .filter { it.descriptor.isSupportedFile(file) }
+        log.info("StyleBreeze navigation request file=${file.path} offset=$offset clients=${clients.size}")
 
         for (client in clients) {
             if (isStylesheet(file) && !isCustomPropertyAt(document.charsSequence, offset)) {
@@ -67,17 +68,20 @@ class StyleBreezeGotoDeclarationHandler : GotoDeclarationHandler {
                     }
                 } ?: continue
                 val recognized = !declaration.left.isNullOrEmpty() || !declaration.right.isNullOrEmpty()
+                log.info("StyleBreeze definition response file=${file.path} recognized=$recognized left=${declaration.left?.size ?: 0} right=${declaration.right?.size ?: 0}")
                 if (!recognized) continue
                 val declarationTargets = buildList {
                     declaration.left?.forEach { add(Target(it.uri, it.range)) }
                     declaration.right?.forEach { add(Target(it.targetUri, it.targetSelectionRange)) }
                 }
-                val currentUri = client.getDocumentIdentifier(file).uri
                 val selectedDeclaration = declarationTargets.any { target ->
-                    target.uri == currentUri && target.range.contains(position)
+                    client.descriptor.findFileByUri(target.uri)?.identity() == file.identity() &&
+                        target.range.contains(position)
                 }
                 if (!selectedDeclaration) {
-                    return mapTargets(client, declarationTargets).toTypedArray()
+                    val mapped = mapTargets(client, declarationTargets)
+                    log.info("StyleBreeze forward navigation file=${file.path} protocolTargets=${declarationTargets.size} mappedTargets=${mapped.size}")
+                    return mapped.takeIf { it.isNotEmpty() }?.toTypedArray()
                 }
                 val references = request("references") {
                     client.sendRequestSync(2_000) { server ->
@@ -94,6 +98,7 @@ class StyleBreezeGotoDeclarationHandler : GotoDeclarationHandler {
                     client,
                     references.map { Target(it.uri, it.range) },
                 ).filterNot { it.containingFile?.virtualFile == file }
+                log.info("StyleBreeze reverse navigation file=${file.path} references=${references.size} mappedTargets=${targets.size}")
                 return when (targets.size) {
                     // IntelliJ continues to later declaration handlers when an
                     // extension returns an empty array. Return a no-op target so
@@ -139,12 +144,24 @@ class StyleBreezeGotoDeclarationHandler : GotoDeclarationHandler {
         val psiManager = PsiManager.getInstance(client.project)
         val seen = mutableSetOf<String>()
         return targets.mapNotNull { target ->
-            val virtualFile = client.descriptor.findFileByUri(target.uri) ?: return@mapNotNull null
+            val virtualFile = client.descriptor.findFileByUri(target.uri) ?: run {
+                log.warn("StyleBreeze could not map navigation URI ${target.uri}")
+                return@mapNotNull null
+            }
             val identity = "${virtualFile.identity()}:${target.range.start.line}:${target.range.start.character}"
             if (!seen.add(identity)) return@mapNotNull null
-            val psiFile = psiManager.findFile(virtualFile) ?: return@mapNotNull null
-            val targetDocument = FileDocumentManager.getInstance().getDocument(virtualFile) ?: return@mapNotNull null
-            val targetOffset = targetDocument.offset(target.range.start) ?: return@mapNotNull null
+            val psiFile = psiManager.findFile(virtualFile) ?: run {
+                log.warn("StyleBreeze could not load PSI for ${virtualFile.path}")
+                return@mapNotNull null
+            }
+            val targetDocument = FileDocumentManager.getInstance().getDocument(virtualFile) ?: run {
+                log.warn("StyleBreeze could not load document for ${virtualFile.path}")
+                return@mapNotNull null
+            }
+            val targetOffset = targetDocument.offset(target.range.start) ?: run {
+                log.warn("StyleBreeze received invalid target position ${target.range.start} for ${virtualFile.path}")
+                return@mapNotNull null
+            }
             psiFile.findElementAt(targetOffset) ?: psiFile
         }
     }

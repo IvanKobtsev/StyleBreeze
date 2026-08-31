@@ -57,6 +57,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
         const propertyRange = document.getWordRangeAtPosition(position, /--[A-Za-z0-9_-]+/);
         if (propertyRange) return next(document, position, token);
+        const definitions = await client?.sendRequest<ProtocolLocation[]>(
+          'textDocument/definition',
+          { textDocument: { uri: document.uri.toString() }, position },
+          token,
+        );
+        const selectedDeclaration = definitions?.some(
+          (location) =>
+            sameFileUri(location.uri, document.uri) && rangeContains(location.range, position),
+        );
+        if (!selectedDeclaration) return definitions?.map(toVscodeLocation) ?? [];
         const references = await client?.sendRequest<ProtocolLocation[]>(
           'textDocument/references',
           {
@@ -66,16 +76,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
           },
           token,
         );
-        return references?.map(
-          (location) =>
-            new vscode.Location(
-              vscode.Uri.parse(location.uri),
-              new vscode.Range(
-                new vscode.Position(location.range.start.line, location.range.start.character),
-                new vscode.Position(location.range.end.line, location.range.end.character),
-              ),
-            ),
-        ) ?? [];
+        return references?.map(toVscodeLocation) ?? [];
       },
     },
     outputChannelName: 'StyleBreeze',
@@ -130,6 +131,28 @@ interface ProtocolLocation {
     start: { line: number; character: number };
     end: { line: number; character: number };
   };
+}
+
+function toVscodeLocation(location: ProtocolLocation): vscode.Location {
+  return new vscode.Location(
+    vscode.Uri.parse(location.uri),
+    new vscode.Range(
+      new vscode.Position(location.range.start.line, location.range.start.character),
+      new vscode.Position(location.range.end.line, location.range.end.character),
+    ),
+  );
+}
+
+function sameFileUri(raw: string, expected: vscode.Uri): boolean {
+  const actual = vscode.Uri.parse(raw);
+  return process.platform === 'win32'
+    ? actual.fsPath.toLowerCase() === expected.fsPath.toLowerCase()
+    : actual.fsPath === expected.fsPath;
+}
+
+function rangeContains(range: ProtocolLocation['range'], position: vscode.Position): boolean {
+  return position.isAfterOrEqual(new vscode.Position(range.start.line, range.start.character)) &&
+    position.isBeforeOrEqual(new vscode.Position(range.end.line, range.end.character));
 }
 
 interface ModifierDecoration {

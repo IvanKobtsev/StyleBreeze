@@ -4,7 +4,9 @@ use lsp_types::{notification as notif, request as req, *};
 use lsp_types::{notification::Notification as _, request::Request as _};
 use std::{
     collections::HashMap,
+    fmt,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 use stylebreeze_analysis::Project;
 use stylebreeze_protocol::{diagnostic_to_lsp, location_to_lsp, position_to_offset, span_to_range};
@@ -63,8 +65,13 @@ fn main() -> Result<()> {
     let init = connection.initialize(serde_json::to_value(capabilities)?)?;
     let params: InitializeParams = serde_json::from_value(init)?;
     let roots = workspace_roots(&params);
+    debug_log(format_args!("initialize roots={roots:?}"));
     let mut project = Project::new(roots);
     project.index_workspace();
+    debug_log(format_args!(
+        "workspace indexed files={}",
+        project.file_paths().count()
+    ));
     for msg in &connection.receiver {
         match msg {
             Message::Request(r) => {
@@ -102,6 +109,7 @@ fn handle_notification(c: &Connection, p: &mut Project, n: Notification) -> Resu
                     q.text_document.text,
                     Some(q.text_document.version),
                 );
+                log_sass_file("open", p, &path);
                 publish_all(c, p)?;
             }
         }
@@ -112,6 +120,7 @@ fn handle_notification(c: &Connection, p: &mut Project, n: Notification) -> Resu
                 q.content_changes.into_iter().last(),
             ) {
                 p.open_or_update_file(path.clone(), change.text, Some(q.text_document.version));
+                log_sass_file("change", p, &path);
                 publish_all(c, p)?;
             }
         }
@@ -130,6 +139,7 @@ fn handle_notification(c: &Connection, p: &mut Project, n: Notification) -> Resu
                         p.remove_file(&path);
                     } else if let Ok(s) = std::fs::read_to_string(&path) {
                         p.open_or_update_file(path.clone(), s, None);
+                        log_sass_file("watched-file", p, &path);
                     }
                     publish_all(c, p)?;
                 }
@@ -173,6 +183,7 @@ fn handle_notification(c: &Connection, p: &mut Project, n: Notification) -> Resu
                 })
                 .unwrap_or_default();
             p.set_sass_load_root_strings(sass_roots);
+            debug_log(format_args!("configuration updated"));
             publish_all(c, p)?;
         }
         _ => {}
@@ -198,6 +209,11 @@ fn handle_request(c: &Connection, p: &Project, r: Request) -> Result<()> {
                 .into_iter()
                 .filter_map(|l| p.source(&l.path).and_then(|s| location_to_lsp(&l, s)))
                 .collect();
+            debug_log(format_args!(
+                "definition path={} offset={at} targets={}",
+                path.display(),
+                locations.len()
+            ));
             Ok(serde_json::to_value(GotoDefinitionResponse::Array(
                 locations,
             ))?)
@@ -220,6 +236,12 @@ fn handle_request(c: &Connection, p: &Project, r: Request) -> Result<()> {
                 .into_iter()
                 .filter_map(|l| p.source(&l.path).and_then(|s| location_to_lsp(&l, s)))
                 .collect();
+            debug_log(format_args!(
+                "references path={} offset={at} include_declaration={} targets={}",
+                path.display(),
+                q.context.include_declaration,
+                locs.len()
+            ));
             Ok(serde_json::to_value(locs)?)
         }
         req::Completion::METHOD => {
@@ -278,6 +300,11 @@ fn handle_request(c: &Connection, p: &Project, r: Request) -> Result<()> {
                     ..Default::default()
                 })
                 .collect();
+            debug_log(format_args!(
+                "completion path={} offset={at} items={}",
+                path.display(),
+                items.len()
+            ));
             Ok(serde_json::to_value(CompletionResponse::Array(items))?)
         }
         req::HoverRequest::METHOD => {
@@ -358,6 +385,11 @@ fn handle_request(c: &Connection, p: &Project, r: Request) -> Result<()> {
                     new_text: edit.new_text,
                 })
                 .collect();
+            debug_log(format_args!(
+                "fix-sass-imports path={} edits={}",
+                path.display(),
+                edits.len()
+            ));
             Ok(serde_json::json!({ "version": p.version(&path), "edits": edits }))
         }
         req::PrepareRenameRequest::METHOD => {
@@ -550,6 +582,22 @@ fn handle_request(c: &Connection, p: &Project, r: Request) -> Result<()> {
         )))?,
     }
     Ok(())
+}
+fn debug_log(arguments: fmt::Arguments<'_>) {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if *ENABLED.get_or_init(|| {
+        std::env::var("STYLEBREEZE_LOG").is_ok_and(|value| !value.is_empty() && value != "off")
+    }) {
+        eprintln!("[stylebreeze] {arguments}");
+    }
+}
+fn log_sass_file(event: &str, project: &Project, path: &Path) {
+    if let Some(summary) = project.sass_debug_summary(path) {
+        debug_log(format_args!(
+            "scss-{event} path={} {summary}",
+            path.display()
+        ));
+    }
 }
 fn edit_distance(a: &str, b: &str) -> usize {
     let mut previous: Vec<_> = (0..=b.len()).collect();

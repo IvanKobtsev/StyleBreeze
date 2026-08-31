@@ -1655,6 +1655,20 @@ impl Project {
             .get(&canonical_or(path.to_path_buf()))
             .and_then(|f| f.version)
     }
+    pub fn sass_debug_summary(&self, path: &Path) -> Option<String> {
+        let file = self.files.get(&canonical_or(path.to_path_buf()))?;
+        let resolved = file
+            .sass_dependencies
+            .iter()
+            .filter(|dependency| dependency.source.is_some())
+            .count();
+        Some(format!(
+            "declarations={} references={} dependencies={} resolved_dependencies={resolved}",
+            file.sass_declarations.len(),
+            file.sass_references.len(),
+            file.sass_dependencies.len(),
+        ))
+    }
     pub fn custom_property_occurrences(&self, path: &Path) -> Vec<CustomPropertyOccurrence> {
         let p = canonical_or(path.to_path_buf());
         let Some(f) = self.files.get(&p) else {
