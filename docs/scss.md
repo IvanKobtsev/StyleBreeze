@@ -4,6 +4,11 @@ StyleBreeze indexes Sass variables, mixins, functions, and module relationships
 across every `.scss` file in the workspace. The same resolved symbol identity is
 used for navigation, find usages, usage counts, rename, and completion.
 
+Declarations with no resolved usages are published as unnecessary hint
+diagnostics and rendered faded by supporting editors. This applies independently
+to Sass variables, mixins, and functions, including declarations reached through
+namespaced, star-imported, or forwarded modules.
+
 ## Supported module behavior
 
 - Local declarations and references for `$variables`, `@mixin`/`@include`, and

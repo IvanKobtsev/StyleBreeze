@@ -1050,6 +1050,43 @@ impl Project {
             .map(|f| f.diagnostics.clone())
             .unwrap_or_default();
         if let Some(f) = self.files.get(&p) {
+            for declaration in &f.sass_declarations {
+                if self
+                    .references_at(&p, declaration.span.start, false)
+                    .is_empty()
+                {
+                    let code = match declaration.kind {
+                        SassSymbolKind::Variable => "unused-sass-variable",
+                        SassSymbolKind::Mixin => "unused-sass-mixin",
+                        SassSymbolKind::Function => "unused-sass-function",
+                    };
+                    let span = if declaration.kind == SassSymbolKind::Variable
+                        && declaration.span.start > 0
+                        && f.source.as_bytes()[declaration.span.start - 1] == b'$'
+                    {
+                        Span {
+                            start: declaration.span.start - 1,
+                            end: declaration.span.end,
+                        }
+                    } else {
+                        declaration.span
+                    };
+                    out.push(Diagnostic {
+                        location: Location {
+                            path: p.clone(),
+                            span,
+                        },
+                        severity: Severity::Hint,
+                        code,
+                        message: format!(
+                            "{} '{}' is unused",
+                            sass_kind_name(declaration.kind),
+                            declaration.name
+                        ),
+                        unnecessary: true,
+                    });
+                }
+            }
             for reference in &f.property_references {
                 if !f.suppressed_lines.contains(&reference.line)
                     && !self.property_resolved(&p, &reference.name)
@@ -2703,5 +2740,44 @@ mod tests {
                 .new_text
                 .contains("@use \"src/styles/tokens.scss\" as *;")
         );
+    }
+
+    #[test]
+    fn unused_sass_declarations_are_faded_by_kind() {
+        let d = tempdir().unwrap();
+        let scss = d.path().join("symbols.scss");
+        let source = "$used: 1; $unused: 2;\n@mixin idle {}\n@function dormant() { @return 1; }\n.x { width: $used; }";
+        fs::write(&scss, source).unwrap();
+        let mut project = Project::new(vec![d.path().into()]);
+        project.index_workspace();
+        let diagnostics = project.diagnostics_for(&scss);
+        let unused: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code.starts_with("unused-sass-"))
+            .collect();
+        assert_eq!(unused.len(), 3);
+        assert!(
+            unused.iter().all(|diagnostic| {
+                diagnostic.unnecessary && diagnostic.severity == Severity::Hint
+            })
+        );
+        assert!(
+            unused
+                .iter()
+                .any(|diagnostic| diagnostic.code == "unused-sass-variable")
+        );
+        assert!(
+            unused
+                .iter()
+                .any(|diagnostic| diagnostic.code == "unused-sass-mixin")
+        );
+        assert!(
+            unused
+                .iter()
+                .any(|diagnostic| diagnostic.code == "unused-sass-function")
+        );
+        assert!(unused.iter().all(|diagnostic| {
+            &source[diagnostic.location.span.start..diagnostic.location.span.end] != "$used"
+        }));
     }
 }

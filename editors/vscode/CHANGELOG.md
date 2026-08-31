@@ -8,3 +8,5 @@
   auto-import completion, rename, and import-path fixing infrastructure.
 - Fixed `.module.scss` navigation so usages open declarations while declarations
   continue to open their usages.
+- Fade unused Sass variable, mixin, and function declarations using resolved
+  project-wide usages.
