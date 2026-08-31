@@ -17,7 +17,7 @@ The stylesheet parser emits exact declaration, reference, and module-directive
 spans. The resolver applies ordered Sass load roots and Sass partial/index lookup.
 The analysis project assigns symbol identity to the declaration file, kind, and
 canonical Sass name, then resolves visibility through a cycle-safe module graph.
-LSP completion and import-fixing responses contain edits; IntelliJ only presents
+LSP completion responses contain the auto-import edits; IntelliJ only presents
 and applies them.
 
 ## Consequences

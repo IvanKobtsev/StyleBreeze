@@ -8,7 +8,7 @@
   <depends>JavaScript</depends>
   <extensions defaultExtensionNs="com.intellij">
     <platform.lsp.integrationProvider implementation="dev.stylebreeze.intellij.StyleBreezeLspProvider"/>
-    <postStartupActivity implementation="dev.stylebreeze.intellij.StyleBreezeSassSaveActivity"/>
+    <postStartupActivity implementation="dev.stylebreeze.intellij.StyleBreezeSassStartupActivity"/>
     <projectConfigurable
         id="stylebreeze.scss"
         displayName="StyleBreeze SCSS"

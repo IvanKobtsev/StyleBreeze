@@ -9,7 +9,6 @@ import com.intellij.openapi.project.Project
 import com.intellij.platform.lsp.api.LspClientManager
 import org.eclipse.lsp4j.DidChangeConfigurationParams
 import java.awt.BorderLayout
-import javax.swing.JCheckBox
 import javax.swing.JComponent
 import javax.swing.JLabel
 import javax.swing.JPanel
@@ -23,7 +22,6 @@ import java.util.WeakHashMap
 class StyleBreezeSassSettings : PersistentStateComponent<StyleBreezeSassSettings.State> {
     data class State(
         var loadPaths: MutableList<String> = mutableListOf("."),
-        var fixImportsOnSave: Boolean = true,
     )
 
     private var value = State()
@@ -33,7 +31,6 @@ class StyleBreezeSassSettings : PersistentStateComponent<StyleBreezeSassSettings
 
 class StyleBreezeSassConfigurable(private val project: Project) : SearchableConfigurable {
     private val roots = JTextArea(6, 45)
-    private val fixOnSave = JCheckBox("Fix relative @use and @forward paths on save")
     private var panel: JPanel? = null
 
     override fun getId(): String = "stylebreeze.scss"
@@ -44,24 +41,21 @@ class StyleBreezeSassConfigurable(private val project: Project) : SearchableConf
             add(JScrollPane(roots), BorderLayout.CENTER)
         }
         it.add(header, BorderLayout.CENTER)
-        it.add(fixOnSave, BorderLayout.SOUTH)
         panel = it
         reset()
     }
     override fun isModified(): Boolean {
         val state = project.getService(StyleBreezeSassSettings::class.java).state
-        return paths() != state.loadPaths || fixOnSave.isSelected != state.fixImportsOnSave
+        return paths() != state.loadPaths
     }
     override fun apply() {
         val state = project.getService(StyleBreezeSassSettings::class.java).state
         state.loadPaths = paths().toMutableList()
-        state.fixImportsOnSave = fixOnSave.isSelected
         publishSassSettings(project)
     }
     override fun reset() {
         val state = project.getService(StyleBreezeSassSettings::class.java).state
         roots.text = state.loadPaths.joinToString("\n")
-        fixOnSave.isSelected = state.fixImportsOnSave
     }
     override fun disposeUIResources() { panel = null }
     private fun paths(): List<String> = roots.text.lineSequence().map(String::trim).filter(String::isNotEmpty).toList().ifEmpty { listOf(".") }

@@ -30,16 +30,9 @@ When multiple modules export the same name, completion presents each source as a
 separate choice. Existing namespaced imports are not duplicated with a star
 import.
 
-## Import path fixing
-
-The IntelliJ/WebStorm integration fixes relative paths in `@use` and `@forward`
-before an SCSS document is saved. It preserves quoting and extension style and
-only changes paths that resolve beneath a configured Sass load path. Missing,
-dynamic, external, and already normalized paths are left untouched.
-
-Configure ordered load paths and the on-save toggle under **Settings →
-StyleBreeze SCSS**. Relative load paths are resolved from the project root; `.`
-is the default.
+Configure ordered load paths under **Settings → StyleBreeze SCSS**. Relative
+load paths are resolved from the project root; `.` is the default. StyleBreeze
+does not rewrite existing imports when a document is saved.
 
 ## Navigation behavior
 
@@ -54,8 +47,8 @@ is the default.
 
 The IntelliJ plugin launches the server with SCSS debug logging enabled. Server
 stderr records workspace indexing, SCSS fact counts, resolved dependency counts,
-configuration changes, definition/reference results, completion counts, and
-import-fix edits. The IntelliJ log additionally records navigation requests,
+configuration changes, definition/reference results, and completion counts. The
+IntelliJ log additionally records navigation requests,
 completion dispatches with connected-client and returned-item counts, protocol
 target counts, target mapping, and failures to load a URI, PSI file, or document.
 

@@ -2,8 +2,6 @@ package dev.stylebreeze.intellij
 
 import org.eclipse.lsp4j.Range
 import org.eclipse.lsp4j.TextDocumentPositionParams
-import org.eclipse.lsp4j.TextDocumentIdentifier
-import org.eclipse.lsp4j.TextEdit
 import org.eclipse.lsp4j.jsonrpc.services.JsonRequest
 import org.eclipse.lsp4j.services.LanguageServer
 import java.util.concurrent.CompletableFuture
@@ -11,11 +9,7 @@ import java.util.concurrent.CompletableFuture
 interface StyleBreezeLanguageServer : LanguageServer {
     @JsonRequest("stylebreeze/selectorPreview")
     fun selectorPreview(params: TextDocumentPositionParams): CompletableFuture<SelectorPreviewResponse?>
-    @JsonRequest("stylebreeze/fixSassImports")
-    fun fixSassImports(params: TextDocumentIdentifier): CompletableFuture<SassImportFixResponse>
 }
-
-data class SassImportFixResponse(val version: Int? = null, val edits: List<TextEdit> = emptyList())
 
 data class SelectorPreviewResponse(
     val range: Range? = null,
