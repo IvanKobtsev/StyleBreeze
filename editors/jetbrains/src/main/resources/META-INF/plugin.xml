@@ -1,0 +1,16 @@
+<idea-plugin>
+  <id>dev.stylebreeze.jetbrains</id>
+  <name>StyleBreeze</name>
+  <vendor url="https://github.com/IvanKobtsev/StyleBreeze">Ivan Kobtsev</vendor>
+  <description><![CDATA[StyleContract-compatible CSS and SCSS module diagnostics powered by a native Rust language server.]]></description>
+  <depends>com.intellij.modules.platform</depends>
+  <depends>com.intellij.modules.ultimate</depends>
+  <depends>com.intellij.modules.lsp</depends>
+  <depends>JavaScript</depends>
+  <extensions defaultExtensionNs="com.intellij">
+    <platform.lsp.integrationProvider implementation="dev.stylebreeze.jetbrains.StyleBreezeLspIntegrationProvider"/>
+    <postStartupActivity implementation="dev.stylebreeze.jetbrains.StyleBreezeProjectActivity"/>
+    <projectConfigurable id="dev.stylebreeze.jetbrains.settings" displayName="StyleBreeze" instance="dev.stylebreeze.jetbrains.StyleBreezeConfigurable"/>
+    <notificationGroup id="StyleBreeze" displayType="BALLOON"/>
+  </extensions>
+</idea-plugin>
