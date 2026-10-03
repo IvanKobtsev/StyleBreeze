@@ -18,8 +18,13 @@ class StyleBreezeIssueNotifier(private val project: Project) {
     }
 
     fun workspaceIssue(issue: WorkspaceIssue) {
+        if (project.isDisposed) return
         if (!issue.active) { lastIssue = null; return }
-        notifyOnce(issue.message + (issue.path?.let { "\n$it" } ?: ""))
+        // Parse failures in an edited TS/CSS/SCSS document are transient editor
+        // state. The server already clears diagnostics for that document, so a
+        // project-wide notification would only turn normal typing into noise.
+        // Missing configuration is handled locally by checkConfiguration(); an
+        // invalid existing configuration is reported on the config file itself.
     }
 
     private fun notifyOnce(message: String) {

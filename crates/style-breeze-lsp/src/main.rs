@@ -4,13 +4,15 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use lsp_server::{Connection, Message, Notification};
+use lsp_server::{Connection, Message, Notification, Request, Response};
 use lsp_types::{
     Diagnostic as LspDiagnostic, DiagnosticSeverity, DiagnosticTag, DidChangeTextDocumentParams,
     DidChangeWatchedFilesParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, InitializeParams, NumberOrString, Position,
-    PublishDiagnosticsParams, Range, ServerCapabilities, TextDocumentSyncCapability,
-    TextDocumentSyncKind, TextDocumentSyncOptions, Url,
+    DidSaveTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, InitializeParams,
+    Location as LspLocation, NumberOrString, OneOf, Position, PublishDiagnosticsParams, Range,
+    ReferenceParams, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentSyncOptions, Url,
+    request::{GotoDefinition, References, Request as LspRequest},
 };
 use serde::Serialize;
 use style_contract::{
@@ -61,6 +63,8 @@ fn run_stdio(config_path: PathBuf) -> Result<()> {
                 ..Default::default()
             },
         )),
+        definition_provider: Some(OneOf::Left(true)),
+        references_provider: Some(OneOf::Left(true)),
         ..Default::default()
     };
     let params: InitializeParams =
@@ -156,15 +160,7 @@ impl Server {
                     self.clear_all(connection);
                     return Ok(());
                 }
-                Message::Request(request) => {
-                    connection
-                        .sender
-                        .send(Message::Response(lsp_server::Response::new_err(
-                            request.id,
-                            lsp_server::ErrorCode::MethodNotFound as i32,
-                            "StyleBreeze exposes diagnostics only".into(),
-                        )))?
-                }
+                Message::Request(request) => self.request(connection, request)?,
                 Message::Notification(notification) => {
                     let mut publish = self.notification(connection, notification);
                     if publish {
@@ -187,6 +183,129 @@ impl Server {
                 Message::Response(_) => {}
             }
         }
+    }
+
+    fn request(&self, connection: &Connection, request: Request) -> Result<()> {
+        let Request { id, method, params } = request;
+        let result = match method.as_str() {
+            GotoDefinition::METHOD => {
+                serde_json::from_value::<GotoDefinitionParams>(params).map(|params| {
+                    let locations = self.navigation_locations(
+                        &params.text_document_position_params.text_document.uri,
+                        params.text_document_position_params.position,
+                        |index, path, line, column| index.definitions_at(path, line, column),
+                    );
+                    serde_json::to_value(GotoDefinitionResponse::Array(locations))
+                })
+            }
+            References::METHOD => serde_json::from_value::<ReferenceParams>(params).map(|params| {
+                let include = params.context.include_declaration;
+                let locations = self.navigation_locations(
+                    &params.text_document_position.text_document.uri,
+                    params.text_document_position.position,
+                    |index, path, line, column| index.references_at(path, line, column, include),
+                );
+                serde_json::to_value(locations)
+            }),
+            _ => {
+                connection.sender.send(Message::Response(Response::new_err(
+                    id,
+                    lsp_server::ErrorCode::MethodNotFound as i32,
+                    format!("Unsupported request: {method}"),
+                )))?;
+                return Ok(());
+            }
+        };
+        let response = match result {
+            Ok(Ok(value)) => Response::new_ok(id, value),
+            Ok(Err(error)) | Err(error) => Response::new_err(
+                id,
+                lsp_server::ErrorCode::InvalidParams as i32,
+                error.to_string(),
+            ),
+        };
+        connection.sender.send(Message::Response(response))?;
+        Ok(())
+    }
+
+    fn navigation_locations(
+        &self,
+        uri: &Url,
+        position: Position,
+        query: impl FnOnce(
+            &WorkspaceIndex,
+            &Path,
+            usize,
+            usize,
+        ) -> Vec<style_contract::workspace::NavigationTarget>,
+    ) -> Vec<LspLocation> {
+        let (Some(index), Ok(path), Some((line, column))) = (
+            self.index.as_ref(),
+            uri.to_file_path(),
+            self.engine_position(uri, position),
+        ) else {
+            return Vec::new();
+        };
+        query(index, &path, line, column)
+            .into_iter()
+            .filter_map(|target| self.to_lsp_location(target))
+            .collect()
+    }
+
+    fn engine_position(&self, uri: &Url, position: Position) -> Option<(usize, usize)> {
+        let text = self.document_text(uri)?;
+        let offset = offset_at(&text, position)?;
+        let prefix = &text[..offset];
+        let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let column = prefix
+            .rsplit_once('\n')
+            .map_or(prefix.len() + 1, |(_, tail)| tail.len() + 1);
+        Some((line, column))
+    }
+
+    fn to_lsp_location(
+        &self,
+        target: style_contract::workspace::NavigationTarget,
+    ) -> Option<LspLocation> {
+        let path = ordinary_windows_path(&target.location.path);
+        let uri = Url::from_file_path(&path).ok()?;
+        let text = self.document_text(&uri)?;
+        let line = target.location.line.checked_sub(1)?;
+        let line_start = text
+            .split_inclusive('\n')
+            .take(line)
+            .map(str::len)
+            .sum::<usize>();
+        let start = line_start + target.location.column.checked_sub(1)?;
+        let end = start.checked_add(target.length)?.min(text.len());
+        if !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            return None;
+        }
+        Some(LspLocation::new(
+            uri,
+            Range::new(position_at_byte(&text, start), position_at_byte(&text, end)),
+        ))
+    }
+
+    fn document_text(&self, uri: &Url) -> Option<String> {
+        self.open
+            .get(uri)
+            .map(|document| document.text.clone())
+            .or_else(|| {
+                let path = uri.to_file_path().ok()?;
+                self.open.iter().find_map(|(candidate, document)| {
+                    candidate
+                        .to_file_path()
+                        .ok()
+                        .is_some_and(|candidate| same_path(&candidate, &path))
+                        .then(|| document.text.clone())
+                })
+            })
+            .or_else(|| {
+                uri.to_file_path()
+                    .ok()
+                    .and_then(|path| std::fs::read_to_string(path).ok())
+            })
     }
 
     fn notification(&mut self, connection: &Connection, notification: Notification) -> bool {
@@ -450,9 +569,11 @@ fn unused_symbol_range(symbol: &UnusedSymbol, text: &str) -> Option<Range> {
     if !text.is_char_boundary(name_start) {
         return None;
     }
-    let start = if symbol.kind == UnusedSymbolKind::Class
-        && name_start > 0
-        && text.as_bytes().get(name_start - 1) == Some(&b'.')
+    let is_class = matches!(
+        symbol.kind,
+        UnusedSymbolKind::Class | UnusedSymbolKind::DependentClass
+    );
+    let start = if is_class && name_start > 0 && text.as_bytes().get(name_start - 1) == Some(&b'.')
     {
         name_start - 1
     } else {
@@ -489,6 +610,7 @@ fn position_at_byte(text: &str, byte: usize) -> Position {
 fn unused_symbol_diagnostic(symbol: &UnusedSymbol, text: &str) -> Option<LspDiagnostic> {
     let (rule, label) = match symbol.kind {
         UnusedSymbolKind::Class => ("unused-class", "class"),
+        UnusedSymbolKind::DependentClass => ("unused-dependent-class", "dependent class"),
         UnusedSymbolKind::Export => ("unused-export", ":export key"),
     };
     Some(LspDiagnostic {
@@ -631,7 +753,11 @@ fn find_rule_open(text: &str, start: usize) -> Option<usize> {
 }
 
 fn diagnostic_tags(rule: &str) -> Option<Vec<DiagnosticTag>> {
-    matches!(rule, "unused-class" | "unused-export").then(|| vec![DiagnosticTag::UNNECESSARY])
+    matches!(
+        rule,
+        "unused-class" | "unused-dependent-class" | "unused-export"
+    )
+    .then(|| vec![DiagnosticTag::UNNECESSARY])
 }
 
 fn utf16_column(line: &str, byte_column: usize) -> u32 {
@@ -663,7 +789,7 @@ fn diagnostic_columns(line: &str, byte_column: usize) -> (u32, u32) {
 
 fn diagnostic_columns_for_rule(line: &str, byte_column: usize, rule: &str) -> (u32, u32) {
     let (start, end) = diagnostic_columns(line, byte_column);
-    if rule == "unused-class"
+    if matches!(rule, "unused-class" | "unused-dependent-class")
         && byte_column > 0
         && line.as_bytes().get(byte_column - 1) == Some(&b'.')
     {
@@ -737,9 +863,44 @@ fn same_path(left: &Path, right: &Path) -> bool {
     }
 }
 
+fn ordinary_windows_path(path: &Path) -> PathBuf {
+    if cfg!(windows) {
+        let value = path.to_string_lossy();
+        PathBuf::from(value.strip_prefix(r"\\?\").unwrap_or(&value))
+    } else {
+        path.to_path_buf()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir()
+                .join(format!("style-breeze-test-{}-{unique}", std::process::id()));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn converts_utf8_byte_columns_to_utf16() {
@@ -765,6 +926,33 @@ mod tests {
         assert_eq!(
             diagnostic_columns_for_rule(".border-top {}", 1, "missing-symbol"),
             (1, 11)
+        );
+    }
+
+    #[test]
+    fn dependent_class_range_includes_the_selector_dot() {
+        assert_eq!(
+            diagnostic_columns_for_rule("  &.selected {}", 4, "unused-dependent-class"),
+            (3, 12)
+        );
+        let symbol = UnusedSymbol {
+            location: style_contract::diagnostic::Location {
+                path: PathBuf::from("styles.module.scss"),
+                line: 1,
+                column: 5,
+            },
+            name: "selected".into(),
+            kind: UnusedSymbolKind::DependentClass,
+        };
+        let diagnostic = unused_symbol_diagnostic(&symbol, "  &.selected {}").unwrap();
+        assert_eq!(
+            diagnostic.code,
+            Some(NumberOrString::String("unused-dependent-class".into()))
+        );
+        assert_eq!(diagnostic.tags, Some(vec![DiagnosticTag::UNNECESSARY]));
+        assert_eq!(
+            diagnostic.range,
+            Range::new(Position::new(0, 3), Position::new(0, 12))
         );
     }
 
@@ -812,6 +1000,10 @@ mod tests {
         );
         assert_eq!(
             diagnostic_tags("unused-export"),
+            Some(vec![DiagnosticTag::UNNECESSARY])
+        );
+        assert_eq!(
+            diagnostic_tags("unused-dependent-class"),
             Some(vec![DiagnosticTag::UNNECESSARY])
         );
         assert_eq!(diagnostic_tags("missing-symbol"), None);
@@ -895,5 +1087,102 @@ mod tests {
         let extended = canonical.to_string_lossy();
         let ordinary = PathBuf::from(extended.strip_prefix(r"\\?\").unwrap_or(&extended));
         assert!(same_path(&canonical, &ordinary));
+    }
+
+    #[test]
+    fn lsp_definition_and_references_return_precise_module_locations() {
+        let temp = TestDirectory::new();
+        let src = temp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        let style = src.join("card.module.css");
+        let code = src.join("card.ts");
+        fs::write(&style, ".root { color: red; }").unwrap();
+        fs::write(
+            &code,
+            "import styles from './card.module.css'; styles.root;",
+        )
+        .unwrap();
+        let config = temp.path().join("style-contract.json");
+        fs::write(&config, r#"{ convention: "camel-case" }"#).unwrap();
+        let index = WorkspaceIndex::load(temp.path().to_path_buf(), config.clone()).unwrap();
+        let server = Server {
+            root: temp.path().to_path_buf(),
+            config_path: config,
+            index: Some(index),
+            open: HashMap::new(),
+            dirty_documents: HashSet::new(),
+            invalid_documents: HashSet::new(),
+            published: HashSet::new(),
+        };
+        let code_uri = Url::from_file_path(&code).unwrap();
+        let style_uri = Url::from_file_path(&style).unwrap();
+        let definitions = server.navigation_locations(
+            &code_uri,
+            Position::new(0, 48),
+            |index, path, line, column| index.definitions_at(path, line, column),
+        );
+        assert_eq!(definitions.len(), 1);
+        assert!(same_path(
+            &definitions[0].uri.to_file_path().unwrap(),
+            &style_uri.to_file_path().unwrap()
+        ));
+        assert_eq!(
+            definitions[0].range,
+            Range::new(Position::new(0, 1), Position::new(0, 5))
+        );
+
+        let references = server.navigation_locations(
+            &style_uri,
+            Position::new(0, 2),
+            |index, path, line, column| index.references_at(path, line, column, false),
+        );
+        assert_eq!(references.len(), 1);
+        assert!(same_path(
+            &references[0].uri.to_file_path().unwrap(),
+            &code_uri.to_file_path().unwrap()
+        ));
+        assert_eq!(
+            references[0].range,
+            Range::new(Position::new(0, 47), Position::new(0, 51))
+        );
+    }
+
+    #[test]
+    fn navigation_ranges_use_open_utf16_text() {
+        let temp = TestDirectory::new();
+        let path = temp.path().join("styles.module.css");
+        fs::write(&path, ".name {}").unwrap();
+        let uri = Url::from_file_path(&path).unwrap();
+        let mut open = HashMap::new();
+        open.insert(
+            uri.clone(),
+            OpenDocument {
+                version: 1,
+                text: "😀 .name {}".into(),
+            },
+        );
+        let server = Server {
+            root: temp.path().to_path_buf(),
+            config_path: temp.path().join("style-contract.json"),
+            index: None,
+            open,
+            dirty_documents: HashSet::new(),
+            invalid_documents: HashSet::new(),
+            published: HashSet::new(),
+        };
+        let target = style_contract::workspace::NavigationTarget {
+            location: style_contract::diagnostic::Location {
+                path,
+                line: 1,
+                column: 7,
+            },
+            length: 4,
+            role: style_contract::workspace::NavigationRole::Declaration,
+        };
+        let location = server.to_lsp_location(target).unwrap();
+        assert_eq!(
+            location.range,
+            Range::new(Position::new(0, 4), Position::new(0, 8))
+        );
     }
 }

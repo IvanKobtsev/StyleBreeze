@@ -1,6 +1,6 @@
 # StyleBreeze
 
-StyleBreeze is a WebStorm plugin that displays diagnostics from the same Rust analysis engine as [StyleContract](https://github.com/IvanKobtsev/StyleContract). It supports TypeScript, TSX, CSS, and SCSS files, including unsaved editor changes.
+StyleBreeze is a WebStorm plugin that displays diagnostics and provides precise CSS Module navigation using the same Rust analysis engine as [StyleContract](https://github.com/IvanKobtsev/StyleContract). It supports TypeScript, TSX, CSS, and SCSS files, including unsaved editor changes. Navigate from TypeScript references to their declarations, or from class declarations to their exact TypeScript usages, without unrelated same-named classes from other modules.
 
 ## Development
 

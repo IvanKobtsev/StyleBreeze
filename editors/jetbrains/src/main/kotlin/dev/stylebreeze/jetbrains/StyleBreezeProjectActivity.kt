@@ -19,8 +19,7 @@ class StyleBreezeProjectActivity : ProjectActivity {
                 val config = settings.configPath(project)?.toString() ?: return
                 val relevant = events.any {
                     it.path.equals(config, ignoreCase = System.getProperty("os.name").startsWith("Windows")) ||
-                        it.path.endsWith("/tsconfig.json") ||
-                        it.path.substringAfterLast('.').lowercase() in setOf("ts", "tsx", "css", "scss")
+                        it.path.endsWith("/tsconfig.json")
                 }
                 if (!relevant) return
                 ApplicationManager.getApplication().invokeLater {
