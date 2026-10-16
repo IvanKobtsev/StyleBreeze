@@ -121,7 +121,7 @@ impl Server {
                 self.dirty_documents.clear();
                 self.invalid_documents = invalid_documents;
                 self.issue(connection, false, "clear", "", None);
-                self.publish_open(connection);
+                self.publish_workspace(connection);
             }
             Err(error) => {
                 self.index = None;
@@ -176,7 +176,7 @@ impl Server {
                             }
                         }
                         if publish {
-                            self.publish_open(connection);
+                            self.publish_workspace(connection);
                         }
                     }
                 }
@@ -410,7 +410,7 @@ impl Server {
         false
     }
 
-    fn publish_open(&mut self, connection: &Connection) {
+    fn publish_workspace(&mut self, connection: &Connection) {
         let dirty: Vec<_> = self.dirty_documents.drain().collect();
         if let Some(index) = &mut self.index {
             for uri in dirty {
@@ -441,33 +441,40 @@ impl Server {
             }
         };
         self.issue(connection, false, "clear", "", None);
-        let uris: Vec<_> = self.open.keys().cloned().collect();
+        let mut current_uris: HashSet<_> = self.open.keys().cloned().collect();
+        current_uris.extend(result.diagnostics.iter().filter_map(|diagnostic| {
+            Url::from_file_path(ordinary_windows_path(&diagnostic.location.path)).ok()
+        }));
+        current_uris.extend(result.unused_symbols.iter().filter_map(|symbol| {
+            Url::from_file_path(ordinary_windows_path(&symbol.location.path)).ok()
+        }));
+        let uris: HashSet<_> = self.published.union(&current_uris).cloned().collect();
         for uri in uris {
             let Ok(path) = uri.to_file_path() else {
                 continue;
             };
-            let Some(document) = self.open.get(&uri) else {
-                continue;
-            };
+            let version = self.open.get(&uri).map(|document| document.version);
             if self.invalid_documents.contains(&uri) {
-                self.publish(connection, uri, Some(document.version), vec![]);
+                self.publish(connection, uri, version, vec![]);
                 continue;
             }
+            let text = self.document_text(&uri).unwrap_or_default();
             let mut diagnostics: Vec<_> = result
                 .diagnostics
                 .iter()
                 .filter(|diagnostic| same_path(&diagnostic.location.path, &path))
-                .map(|diagnostic| to_lsp(diagnostic, &document.text))
+                .map(|diagnostic| to_lsp(diagnostic, &text))
                 .collect();
             diagnostics.extend(
                 result
                     .unused_symbols
                     .iter()
                     .filter(|symbol| same_path(&symbol.location.path, &path))
-                    .filter_map(|symbol| unused_symbol_diagnostic(symbol, &document.text)),
+                    .filter_map(|symbol| unused_symbol_diagnostic(symbol, &text)),
             );
-            self.publish(connection, uri, Some(document.version), diagnostics);
+            self.publish(connection, uri, version, diagnostics);
         }
+        self.published = current_uris;
     }
 
     fn publish_config_error(&mut self, connection: &Connection, message: &str) {
@@ -634,7 +641,7 @@ fn to_lsp(diagnostic: &Diagnostic, text: &str) -> LspDiagnostic {
         .unwrap_or((0, 0));
     let special_range = match diagnostic.rule {
         "empty-rule" => empty_rule_range(diagnostic, text),
-        "module-to-module-import" => stylesheet_import_range(diagnostic, text),
+        "class-leak" => stylesheet_import_range(diagnostic, text),
         _ => None,
     };
     let range = special_range.unwrap_or_else(|| {
@@ -1043,7 +1050,7 @@ mod tests {
     }
 
     #[test]
-    fn module_import_range_covers_the_complete_specifier() {
+    fn class_leak_range_covers_the_complete_specifier() {
         let text = "@use \"src/styles/table.module.scss\" as *;";
         let diagnostic = Diagnostic {
             location: style_contract::diagnostic::Location {
@@ -1052,7 +1059,7 @@ mod tests {
                 column: 7,
             },
             severity: Severity::Warning,
-            rule: "module-to-module-import",
+            rule: "class-leak",
             message: "Example".into(),
         };
         assert_eq!(
@@ -1060,6 +1067,191 @@ mod tests {
             Range::new(Position::new(0, 6), Position::new(0, 34))
         );
         assert_eq!(to_lsp(&diagnostic, text).tags, None);
+    }
+
+    #[test]
+    fn converts_every_style_contract_0_9_3_rule() {
+        for (rule, severity) in [
+            ("missing-symbol", Severity::Error),
+            ("unused-class", Severity::Error),
+            ("unused-dependent-class", Severity::Warning),
+            ("unused-export", Severity::Error),
+            ("naming-convention-local", Severity::Warning),
+            ("naming-convention-global", Severity::Warning),
+            ("dynamic-reference", Severity::Warning),
+            ("empty-rule", Severity::Warning),
+            ("class-leak", Severity::Warning),
+            ("leaked-class-usage", Severity::Warning),
+        ] {
+            let diagnostic = Diagnostic {
+                location: style_contract::diagnostic::Location {
+                    path: PathBuf::from("example.ts"),
+                    line: 1,
+                    column: 1,
+                },
+                severity,
+                rule,
+                message: format!("Example {rule}"),
+            };
+            let converted = to_lsp(&diagnostic, "symbol");
+            assert_eq!(
+                converted.code,
+                Some(NumberOrString::String(rule.to_owned()))
+            );
+            assert_eq!(converted.message, format!("Example {rule}"));
+            assert_eq!(
+                converted.severity,
+                Some(match severity {
+                    Severity::Error => DiagnosticSeverity::ERROR,
+                    Severity::Warning => DiagnosticSeverity::WARNING,
+                    Severity::Off => DiagnosticSeverity::HINT,
+                })
+            );
+        }
+    }
+
+    fn published_diagnostics(connection: &Connection) -> Vec<PublishDiagnosticsParams> {
+        connection
+            .receiver
+            .try_iter()
+            .filter_map(|message| match message {
+                Message::Notification(notification)
+                    if notification.method == "textDocument/publishDiagnostics" =>
+                {
+                    serde_json::from_value(notification.params).ok()
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn publishes_and_clears_diagnostics_for_unopened_files() {
+        let temp = TestDirectory::new();
+        let src = temp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        let style = src.join("card.module.css");
+        let code = src.join("card.ts");
+        fs::write(&style, ".root { color: red; }").unwrap();
+        fs::write(
+            &code,
+            "import styles from './card.module.css'; styles.missing;",
+        )
+        .unwrap();
+        let config = temp.path().join("style-contract.json");
+        fs::write(
+            &config,
+            r#"{ rules: { "unused-class": "off", "unused-export": "off" } }"#,
+        )
+        .unwrap();
+        let index = WorkspaceIndex::load(temp.path().to_path_buf(), config.clone()).unwrap();
+        let mut server = Server {
+            root: temp.path().to_path_buf(),
+            config_path: config,
+            index: Some(index),
+            open: HashMap::new(),
+            dirty_documents: HashSet::new(),
+            invalid_documents: HashSet::new(),
+            published: HashSet::new(),
+        };
+        let (server_connection, client_connection) = Connection::memory();
+
+        server.publish_workspace(&server_connection);
+        let first = published_diagnostics(&client_connection);
+        let code_uri = Url::from_file_path(&code).unwrap();
+        let code_publication = first.iter().find(|item| item.uri == code_uri).unwrap();
+        assert_eq!(code_publication.diagnostics.len(), 1);
+        assert_eq!(
+            code_publication.diagnostics[0].code,
+            Some(NumberOrString::String("missing-symbol".into()))
+        );
+        assert_eq!(code_publication.version, None);
+
+        fs::write(
+            &code,
+            "import styles from './card.module.css'; styles.root;",
+        )
+        .unwrap();
+        assert_eq!(
+            server.index.as_mut().unwrap().refresh_path(&code).unwrap(),
+            RefreshOutcome::Updated
+        );
+        server.publish_workspace(&server_connection);
+        let second = published_diagnostics(&client_connection);
+        let cleared = second.iter().find(|item| item.uri == code_uri).unwrap();
+        assert!(cleared.diagnostics.is_empty());
+        assert!(!server.published.contains(&code_uri));
+    }
+
+    #[test]
+    fn open_overlay_diagnostics_use_the_document_version_and_keep_workspace_findings() {
+        let temp = TestDirectory::new();
+        let src = temp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        let style = src.join("card.module.css");
+        let open_code = src.join("open.ts");
+        let closed_code = src.join("closed.ts");
+        fs::write(&style, ".root { color: red; }").unwrap();
+        fs::write(
+            &open_code,
+            "import styles from './card.module.css'; styles.root;",
+        )
+        .unwrap();
+        fs::write(
+            &closed_code,
+            "import styles from './card.module.css'; styles.closedMissing;",
+        )
+        .unwrap();
+        let config = temp.path().join("style-contract.json");
+        fs::write(
+            &config,
+            r#"{ rules: { "unused-class": "off", "unused-export": "off" } }"#,
+        )
+        .unwrap();
+        let index = WorkspaceIndex::load(temp.path().to_path_buf(), config.clone()).unwrap();
+        let open_uri = Url::from_file_path(&open_code).unwrap();
+        let mut open = HashMap::new();
+        open.insert(
+            open_uri.clone(),
+            OpenDocument {
+                version: 7,
+                text: "import styles from './card.module.css'; styles.openMissing;".into(),
+            },
+        );
+        let mut server = Server {
+            root: temp.path().to_path_buf(),
+            config_path: config,
+            index: Some(index),
+            open,
+            dirty_documents: HashSet::from([open_uri.clone()]),
+            invalid_documents: HashSet::new(),
+            published: HashSet::new(),
+        };
+        let (server_connection, client_connection) = Connection::memory();
+
+        server.publish_workspace(&server_connection);
+        let publications = published_diagnostics(&client_connection);
+        let open_publication = publications
+            .iter()
+            .find(|item| item.uri == open_uri)
+            .unwrap();
+        assert_eq!(open_publication.version, Some(7));
+        assert!(
+            open_publication.diagnostics[0]
+                .message
+                .contains("openMissing")
+        );
+        let closed_uri = Url::from_file_path(&closed_code).unwrap();
+        let closed_publication = publications
+            .iter()
+            .find(|item| item.uri == closed_uri)
+            .unwrap();
+        assert_eq!(closed_publication.version, None);
+        assert!(
+            closed_publication.diagnostics[0]
+                .message
+                .contains("closedMissing")
+        );
     }
 
     #[test]
