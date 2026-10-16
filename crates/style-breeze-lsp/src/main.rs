@@ -6,18 +6,20 @@ use std::{
 use anyhow::{Context, Result, bail};
 use lsp_server::{Connection, Message, Notification, Request, Response};
 use lsp_types::{
-    Diagnostic as LspDiagnostic, DiagnosticSeverity, DiagnosticTag, DidChangeTextDocumentParams,
-    DidChangeWatchedFilesParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, GotoDefinitionParams, GotoDefinitionResponse, InitializeParams,
-    Location as LspLocation, NumberOrString, OneOf, Position, PublishDiagnosticsParams, Range,
-    ReferenceParams, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
-    TextDocumentSyncOptions, Url,
-    request::{GotoDefinition, References, Request as LspRequest},
+    CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams,
+    CodeActionProviderCapability, Diagnostic as LspDiagnostic, DiagnosticSeverity, DiagnosticTag,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, GotoDefinitionParams,
+    GotoDefinitionResponse, InitializeParams, Location as LspLocation, NumberOrString, OneOf,
+    Position, PublishDiagnosticsParams, Range, ReferenceParams, ServerCapabilities,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextDocumentSyncOptions, TextEdit, Url,
+    WorkspaceEdit,
+    request::{CodeActionRequest, GotoDefinition, References, Request as LspRequest},
 };
 use serde::Serialize;
 use style_contract::{
     WorkspaceIndex,
-    diagnostic::{Diagnostic, Severity, UnusedSymbol, UnusedSymbolKind},
+    diagnostic::{Diagnostic, RULES, Severity, UnusedSymbol, UnusedSymbolKind},
     workspace::RefreshOutcome,
 };
 
@@ -65,6 +67,7 @@ fn run_stdio(config_path: PathBuf) -> Result<()> {
         )),
         definition_provider: Some(OneOf::Left(true)),
         references_provider: Some(OneOf::Left(true)),
+        code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         ..Default::default()
     };
     let params: InitializeParams =
@@ -207,6 +210,8 @@ impl Server {
                 );
                 serde_json::to_value(locations)
             }),
+            CodeActionRequest::METHOD => serde_json::from_value::<CodeActionParams>(params)
+                .map(|params| serde_json::to_value(self.code_actions(params))),
             _ => {
                 connection.sender.send(Message::Response(Response::new_err(
                     id,
@@ -226,6 +231,28 @@ impl Server {
         };
         connection.sender.send(Message::Response(response))?;
         Ok(())
+    }
+
+    fn code_actions(&self, params: CodeActionParams) -> Vec<CodeActionOrCommand> {
+        if params
+            .context
+            .only
+            .as_ref()
+            .is_some_and(|kinds| !kinds.iter().any(|kind| kind == &CodeActionKind::QUICKFIX))
+        {
+            return Vec::new();
+        }
+        let uri = params.text_document.uri;
+        let Some(text) = self.document_text(&uri) else {
+            return Vec::new();
+        };
+        params
+            .context
+            .diagnostics
+            .into_iter()
+            .filter_map(|diagnostic| suppression_action(&uri, &text, diagnostic))
+            .map(CodeActionOrCommand::CodeAction)
+            .collect()
     }
 
     fn navigation_locations(
@@ -644,8 +671,59 @@ fn unused_symbol_diagnostic(symbol: &UnusedSymbol, text: &str) -> Option<LspDiag
         severity: Some(DiagnosticSeverity::HINT),
         code: Some(NumberOrString::String(rule.into())),
         source: Some("StyleContract".into()),
-        message: format!("Unused {label} '{}'", symbol.name),
+        message: diagnostic_message(rule, &format!("Unused {label} '{}'", symbol.name)),
         tags: Some(vec![DiagnosticTag::UNNECESSARY]),
+        ..Default::default()
+    })
+}
+
+fn suppression_action(uri: &Url, text: &str, diagnostic: LspDiagnostic) -> Option<CodeAction> {
+    if diagnostic.source.as_deref() != Some("StyleContract") {
+        return None;
+    }
+    let NumberOrString::String(rule) = diagnostic.code.as_ref()? else {
+        return None;
+    };
+    if !RULES.contains(&rule.as_str()) {
+        return None;
+    }
+    let extension = uri
+        .to_file_path()
+        .ok()?
+        .extension()?
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    let comment = match extension.as_str() {
+        "ts" | "tsx" | "scss" => format!("// @sc-ignore {rule}"),
+        "css" => format!("/* @sc-ignore {rule} */"),
+        _ => return None,
+    };
+    let line_number = diagnostic.range.start.line;
+    let raw_line = text.split_inclusive('\n').nth(line_number as usize)?;
+    let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    let indentation: String = line
+        .chars()
+        .take_while(|character| matches!(character, ' ' | '\t'))
+        .collect();
+    let line_ending =
+        if raw_line.ends_with("\r\n") || (!raw_line.ends_with('\n') && text.contains("\r\n")) {
+            "\r\n"
+        } else {
+            "\n"
+        };
+    let edit = TextEdit::new(
+        Range::new(Position::new(line_number, 0), Position::new(line_number, 0)),
+        format!("{indentation}{comment}{line_ending}"),
+    );
+    Some(CodeAction {
+        title: format!("Suppress {rule} for this line"),
+        kind: Some(CodeActionKind::QUICKFIX),
+        diagnostics: Some(vec![diagnostic]),
+        edit: Some(WorkspaceEdit {
+            changes: Some(HashMap::from([(uri.clone(), vec![edit])])),
+            ..Default::default()
+        }),
         ..Default::default()
     })
 }
@@ -678,10 +756,27 @@ fn to_lsp(diagnostic: &Diagnostic, text: &str) -> LspDiagnostic {
         }),
         code: Some(NumberOrString::String(diagnostic.rule.into())),
         source: Some("StyleContract".into()),
-        message: diagnostic.message.clone(),
+        message: diagnostic_message(diagnostic.rule, &diagnostic.message),
         tags: diagnostic_tags(diagnostic.rule),
         ..Default::default()
     }
+}
+
+fn diagnostic_message(rule: &str, message: &str) -> String {
+    let label = match rule {
+        "missing-symbol" => "Missing symbol",
+        "unused-class" => "Unused class",
+        "unused-dependent-class" => "Unused dependent class",
+        "unused-export" => "Unused export",
+        "naming-convention-local" => "Local naming convention",
+        "naming-convention-global" => "Global naming convention",
+        "dynamic-reference" => "Dynamic reference",
+        "empty-rule" => "Empty rule",
+        "class-leak" => "Class leak",
+        "leaked-class-usage" => "Leaked class usage",
+        _ => return message.to_owned(),
+    };
+    format!("{label}: {message}")
 }
 
 fn stylesheet_import_range(diagnostic: &Diagnostic, text: &str) -> Option<Range> {
@@ -1117,7 +1212,10 @@ mod tests {
                 converted.code,
                 Some(NumberOrString::String(rule.to_owned()))
             );
-            assert_eq!(converted.message, format!("Example {rule}"));
+            assert_eq!(
+                converted.message,
+                diagnostic_message(rule, &format!("Example {rule}"))
+            );
             assert_eq!(
                 converted.severity,
                 Some(match severity {
@@ -1127,6 +1225,106 @@ mod tests {
                 })
             );
         }
+        assert_eq!(
+            diagnostic_message(
+                "missing-symbol",
+                "Reference 'nameWrapper' has no matching class or :export declaration in ProjectCard.module.scss"
+            ),
+            "Missing symbol: Reference 'nameWrapper' has no matching class or :export declaration in ProjectCard.module.scss"
+        );
+    }
+
+    fn style_contract_diagnostic(rule: &str, line: u32) -> LspDiagnostic {
+        LspDiagnostic {
+            range: Range::new(Position::new(line, 2), Position::new(line, 8)),
+            code: Some(NumberOrString::String(rule.to_owned())),
+            source: Some("StyleContract".into()),
+            message: "Example".into(),
+            ..Default::default()
+        }
+    }
+
+    fn suppression_edit<'a>(action: &'a CodeAction, uri: &Url) -> &'a TextEdit {
+        &action.edit.as_ref().unwrap().changes.as_ref().unwrap()[uri][0]
+    }
+
+    #[test]
+    fn offers_suppression_for_every_style_contract_rule() {
+        let uri = Url::from_file_path(std::env::temp_dir().join("example.ts")).unwrap();
+        for rule in RULES {
+            let diagnostic = style_contract_diagnostic(rule, 0);
+            let action = suppression_action(&uri, "value();\n", diagnostic.clone()).unwrap();
+            assert_eq!(action.title, format!("Suppress {rule} for this line"));
+            assert_eq!(action.kind, Some(CodeActionKind::QUICKFIX));
+            assert_eq!(action.diagnostics, Some(vec![diagnostic]));
+            assert_eq!(
+                suppression_edit(&action, &uri).new_text,
+                format!("// @sc-ignore {rule}\n")
+            );
+        }
+    }
+
+    #[test]
+    fn uses_line_comments_for_typescript_and_scss_and_block_comments_for_css() {
+        for (name, expected) in [
+            ("example.ts", "// @sc-ignore empty-rule\n"),
+            ("example.tsx", "// @sc-ignore empty-rule\n"),
+            ("example.scss", "// @sc-ignore empty-rule\n"),
+            ("example.css", "/* @sc-ignore empty-rule */\n"),
+        ] {
+            let uri = Url::from_file_path(std::env::temp_dir().join(name)).unwrap();
+            let action = suppression_action(
+                &uri,
+                "selector {}\n",
+                style_contract_diagnostic("empty-rule", 0),
+            )
+            .unwrap();
+            assert_eq!(suppression_edit(&action, &uri).new_text, expected);
+        }
+    }
+
+    #[test]
+    fn suppression_preserves_indentation_line_and_crlf() {
+        let uri = Url::from_file_path(std::env::temp_dir().join("example.scss")).unwrap();
+        let action = suppression_action(
+            &uri,
+            ".root {\r\n\t  &.unused {}\r\n}\r\n",
+            style_contract_diagnostic("unused-dependent-class", 1),
+        )
+        .unwrap();
+        let edit = suppression_edit(&action, &uri);
+        assert_eq!(
+            edit.range,
+            Range::new(Position::new(1, 0), Position::new(1, 0))
+        );
+        assert_eq!(
+            edit.new_text,
+            "\t  // @sc-ignore unused-dependent-class\r\n"
+        );
+    }
+
+    #[test]
+    fn suppression_rejects_foreign_configuration_and_unknown_diagnostics() {
+        let uri = Url::from_file_path(std::env::temp_dir().join("example.ts")).unwrap();
+        let mut foreign = style_contract_diagnostic("missing-symbol", 0);
+        foreign.source = Some("TypeScript".into());
+        assert!(suppression_action(&uri, "value();\n", foreign).is_none());
+        assert!(
+            suppression_action(
+                &uri,
+                "value();\n",
+                style_contract_diagnostic("configuration", 0)
+            )
+            .is_none()
+        );
+        assert!(
+            suppression_action(
+                &uri,
+                "value();\n",
+                style_contract_diagnostic("imaginary-rule", 0)
+            )
+            .is_none()
+        );
     }
 
     fn published_diagnostics(connection: &Connection) -> Vec<PublishDiagnosticsParams> {

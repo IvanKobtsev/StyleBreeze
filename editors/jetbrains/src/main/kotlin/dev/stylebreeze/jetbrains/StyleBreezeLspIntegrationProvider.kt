@@ -6,10 +6,15 @@ import com.intellij.openapi.application.PathManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.Key
 import com.intellij.openapi.util.SystemInfoRt
+import com.intellij.openapi.util.text.StringUtil
 import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.platform.lsp.api.*
+import com.intellij.platform.lsp.api.customization.LspCustomization
+import com.intellij.platform.lsp.api.customization.LspDiagnosticsCustomizer
+import com.intellij.platform.lsp.api.customization.LspDiagnosticsSupport
 import java.nio.file.Files
 import java.nio.file.Path
+import org.eclipse.lsp4j.Diagnostic
 import org.eclipse.lsp4j.jsonrpc.services.JsonNotification
 
 class StyleBreezeLspIntegrationProvider : LspIntegrationProvider {
@@ -24,6 +29,18 @@ class StyleBreezeLspIntegrationProvider : LspIntegrationProvider {
 
     companion object {
         private val extensions = setOf("ts", "tsx", "css", "scss")
+        private val rules = setOf(
+            "missing-symbol",
+            "unused-class",
+            "unused-dependent-class",
+            "unused-export",
+            "naming-convention-local",
+            "naming-convention-global",
+            "dynamic-reference",
+            "empty-rule",
+            "class-leak",
+            "leaked-class-usage",
+        )
         private val key = Key.create<Descriptor>("dev.stylebreeze.jetbrains.lspDescriptor")
         private fun descriptor(project: Project) = project.getUserData(key) ?: synchronized(project) {
             project.getUserData(key) ?: Descriptor(project).also { project.putUserData(key, it) }
@@ -55,6 +72,21 @@ class StyleBreezeLspIntegrationProvider : LspIntegrationProvider {
         }
 
         private class Descriptor(project: Project) : ProjectWideLspClientDescriptor(project, "StyleBreeze") {
+            override val lspCustomization: LspCustomization = object : LspCustomization() {
+                override val diagnosticsCustomizer: LspDiagnosticsCustomizer = object : LspDiagnosticsSupport() {
+                    override fun getTooltip(diagnostic: Diagnostic): String {
+                        if (diagnostic.source != "StyleContract" || diagnostic.code?.get()?.toString() !in rules) {
+                            return super.getTooltip(diagnostic)
+                        }
+                        val separator = diagnostic.message.indexOf(": ")
+                        if (separator < 0) return super.getTooltip(diagnostic)
+                        val label = StringUtil.escapeXmlEntities(diagnostic.message.substring(0, separator + 1))
+                        val message = StringUtil.escapeXmlEntities(diagnostic.message.substring(separator + 2))
+                        return "<html><b>$label&nbsp;</b>$message</html>"
+                    }
+                }
+            }
+
             override fun isSupportedFile(file: VirtualFile) = StyleBreezeSettings.getInstance(project).state.showDiagnostics && file.extension?.lowercase() in extensions
             override fun createCommandLine(): GeneralCommandLine {
                 val config = checkNotNull(StyleBreezeSettings.getInstance(project).configPath(project))

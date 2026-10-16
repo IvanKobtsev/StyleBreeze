@@ -18,6 +18,8 @@ On first use, diagnostics are enabled automatically when `style-contract.json` e
 
 StyleBreeze publishes the complete StyleContract 0.9.3 rule set to WebStorm's Problems view: `missing-symbol`, `unused-class`, `unused-dependent-class`, `unused-export`, `naming-convention-local`, `naming-convention-global`, `dynamic-reference`, `empty-rule`, `class-leak`, and `leaked-class-usage`. Rule severities and targeted suppressions come directly from the selected StyleContract configuration.
 
+Every StyleContract finding includes a quick fix to suppress that rule for the affected line. StyleBreeze inserts line comments in TypeScript, TSX, and SCSS files, and block comments in CSS files.
+
 ## Packaging
 
 Release packaging follows LocaleBreeze: six native binaries are staged under `dist/jetbrains/<platform>/`, then one cross-platform WebStorm ZIP is produced under `dist/editors/`.
