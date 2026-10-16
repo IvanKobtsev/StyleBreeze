@@ -693,15 +693,19 @@ fn suppression_action(uri: &Url, text: &str, diagnostic: LspDiagnostic) -> Optio
         .extension()?
         .to_string_lossy()
         .to_ascii_lowercase();
-    let comment = match extension.as_str() {
-        "ts" | "tsx" | "scss" => format!("// @sc-ignore {rule}"),
-        "css" => format!("/* @sc-ignore {rule} */"),
-        _ => return None,
-    };
     let line_number = diagnostic.range.start.line;
     let raw_line = text.split_inclusive('\n').nth(line_number as usize)?;
     let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
     let line = line.strip_suffix('\r').unwrap_or(line);
+    let comment = match extension.as_str() {
+        "ts" | "scss" => format!("// @sc-ignore {rule}"),
+        "tsx" if line.trim_start().starts_with('<') => {
+            format!("{{/* @sc-ignore {rule} */}}")
+        }
+        "tsx" => format!("// @sc-ignore {rule}"),
+        "css" => format!("/* @sc-ignore {rule} */"),
+        _ => return None,
+    };
     let indentation: String = line
         .chars()
         .take_while(|character| matches!(character, ' ' | '\t'))
@@ -1265,20 +1269,34 @@ mod tests {
     }
 
     #[test]
-    fn uses_line_comments_for_typescript_and_scss_and_block_comments_for_css() {
-        for (name, expected) in [
-            ("example.ts", "// @sc-ignore empty-rule\n"),
-            ("example.tsx", "// @sc-ignore empty-rule\n"),
-            ("example.scss", "// @sc-ignore empty-rule\n"),
-            ("example.css", "/* @sc-ignore empty-rule */\n"),
+    fn uses_syntax_appropriate_suppression_comments() {
+        for (name, source, expected) in [
+            ("example.ts", "selector {}\n", "// @sc-ignore empty-rule\n"),
+            (
+                "example.tsx",
+                "const value = styles.missing;\n",
+                "// @sc-ignore empty-rule\n",
+            ),
+            (
+                "example.tsx",
+                "  <div className={styles.missing}>\n",
+                "  {/* @sc-ignore empty-rule */}\n",
+            ),
+            (
+                "example.scss",
+                "selector {}\n",
+                "// @sc-ignore empty-rule\n",
+            ),
+            (
+                "example.css",
+                "selector {}\n",
+                "/* @sc-ignore empty-rule */\n",
+            ),
         ] {
             let uri = Url::from_file_path(std::env::temp_dir().join(name)).unwrap();
-            let action = suppression_action(
-                &uri,
-                "selector {}\n",
-                style_contract_diagnostic("empty-rule", 0),
-            )
-            .unwrap();
+            let action =
+                suppression_action(&uri, source, style_contract_diagnostic("empty-rule", 0))
+                    .unwrap();
             assert_eq!(suppression_edit(&action, &uri).new_text, expected);
         }
     }
