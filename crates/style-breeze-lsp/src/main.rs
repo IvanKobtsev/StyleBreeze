@@ -308,6 +308,19 @@ impl Server {
             })
     }
 
+    fn uri_for_path(&self, path: &Path) -> Option<Url> {
+        self.open
+            .keys()
+            .chain(self.published.iter())
+            .find(|uri| {
+                uri.to_file_path()
+                    .ok()
+                    .is_some_and(|candidate| same_path(&candidate, path))
+            })
+            .cloned()
+            .or_else(|| Url::from_file_path(ordinary_windows_path(path)).ok())
+    }
+
     fn notification(&mut self, connection: &Connection, notification: Notification) -> bool {
         match notification.method.as_str() {
             "textDocument/didOpen" => {
@@ -442,12 +455,18 @@ impl Server {
         };
         self.issue(connection, false, "clear", "", None);
         let mut current_uris: HashSet<_> = self.open.keys().cloned().collect();
-        current_uris.extend(result.diagnostics.iter().filter_map(|diagnostic| {
-            Url::from_file_path(ordinary_windows_path(&diagnostic.location.path)).ok()
-        }));
-        current_uris.extend(result.unused_symbols.iter().filter_map(|symbol| {
-            Url::from_file_path(ordinary_windows_path(&symbol.location.path)).ok()
-        }));
+        current_uris.extend(
+            result
+                .diagnostics
+                .iter()
+                .filter_map(|diagnostic| self.uri_for_path(&diagnostic.location.path)),
+        );
+        current_uris.extend(
+            result
+                .unused_symbols
+                .iter()
+                .filter_map(|symbol| self.uri_for_path(&symbol.location.path)),
+        );
         let uris: HashSet<_> = self.published.union(&current_uris).cloned().collect();
         for uri in uris {
             let Ok(path) = uri.to_file_path() else {
@@ -1125,6 +1144,18 @@ mod tests {
             .collect()
     }
 
+    fn publication_for_path<'a>(
+        publications: &'a [PublishDiagnosticsParams],
+        path: &Path,
+    ) -> Option<&'a PublishDiagnosticsParams> {
+        publications.iter().find(|item| {
+            item.uri
+                .to_file_path()
+                .ok()
+                .is_some_and(|candidate| same_path(&candidate, path))
+        })
+    }
+
     #[test]
     fn publishes_and_clears_diagnostics_for_unopened_files() {
         let temp = TestDirectory::new();
@@ -1158,8 +1189,7 @@ mod tests {
 
         server.publish_workspace(&server_connection);
         let first = published_diagnostics(&client_connection);
-        let code_uri = Url::from_file_path(&code).unwrap();
-        let code_publication = first.iter().find(|item| item.uri == code_uri).unwrap();
+        let code_publication = publication_for_path(&first, &code).unwrap();
         assert_eq!(code_publication.diagnostics.len(), 1);
         assert_eq!(
             code_publication.diagnostics[0].code,
@@ -1178,9 +1208,13 @@ mod tests {
         );
         server.publish_workspace(&server_connection);
         let second = published_diagnostics(&client_connection);
-        let cleared = second.iter().find(|item| item.uri == code_uri).unwrap();
+        let cleared = publication_for_path(&second, &code).unwrap();
         assert!(cleared.diagnostics.is_empty());
-        assert!(!server.published.contains(&code_uri));
+        assert!(!server.published.iter().any(|uri| {
+            uri.to_file_path()
+                .ok()
+                .is_some_and(|candidate| same_path(&candidate, &code))
+        }));
     }
 
     #[test]
@@ -1241,11 +1275,7 @@ mod tests {
                 .message
                 .contains("openMissing")
         );
-        let closed_uri = Url::from_file_path(&closed_code).unwrap();
-        let closed_publication = publications
-            .iter()
-            .find(|item| item.uri == closed_uri)
-            .unwrap();
+        let closed_publication = publication_for_path(&publications, &closed_code).unwrap();
         assert_eq!(closed_publication.version, None);
         assert!(
             closed_publication.diagnostics[0]
